@@ -25,13 +25,20 @@ const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
 const DEFAULT_FPS: u32 = 30;
 
-/// How long a frame may take to arrive before the camera counts as gone. The
-/// camera delivers at 15-30 fps, so three seconds of silence is a real stall.
-const STALL_TIMEOUT: Duration = Duration::from_secs(3);
+/// Silence long enough to call the camera gone once it has delivered frames.
+const STALL_TIMEOUT: Duration = Duration::from_millis(1000);
+/// The first frame gets a longer grace: some USB cameras take seconds to start.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long to wait for a frame before the GUI gets a chance to run again.
-const RECV_WAIT: Duration = Duration::from_millis(200);
+const RECV_WAIT: Duration = Duration::from_millis(100);
 /// Retry interval while no camera is available.
 const RECOVER_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the device list is re-read. A query costs well under a
+/// millisecond, so this also drives hot-plug detection and the menu.
+const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+/// After a device vanishes from the list, how long its stream may still be
+/// silent before the camera counts as gone.
+const REMOVAL_GRACE: Duration = Duration::from_millis(250);
 
 // ---------------------------------------------------------------------------
 // Command line
@@ -170,9 +177,11 @@ MENU BAR:
     View → Freeze / Save snapshot / Quit
 
 RECOVERY:
-    If the current camera stops delivering frames (unplugged, driver stalled),
-    the program goes back to the camera it came from, or to any other camera
-    it finds, and keeps retrying every 2 s until one works again.
+    The device list is re-read every 500 ms: a camera connected while the
+    program is running appears in the menu by itself. If the current camera
+    stops delivering frames (unplugged, driver stalled), the program goes back
+    to the camera it came from, or to any other camera it finds, and keeps
+    retrying every 2 s until one works again.
 "
     );
 }
@@ -211,24 +220,27 @@ fn list_cameras() -> Result<()> {
 }
 
 /// A camera as offered by the backend: display name plus the stable system id.
+#[derive(Clone)]
 struct CameraEntry {
     name: String,
     id: String,
 }
 
+/// Devices currently offered by the backend.
+fn query_cameras() -> Result<Vec<CameraEntry>> {
+    let cameras = query(ApiBackend::Auto).context("could not query the camera backend")?;
+    Ok(cameras
+        .into_iter()
+        .map(|info| CameraEntry {
+            name: info.human_name(),
+            id: info.misc(),
+        })
+        .collect())
+}
+
 /// Cameras in the order the backend reports them; empty if the query fails.
 fn camera_entries() -> Vec<CameraEntry> {
-    query(ApiBackend::Auto)
-        .map(|cameras| {
-            cameras
-                .into_iter()
-                .map(|info| CameraEntry {
-                    name: info.human_name(),
-                    id: info.misc(),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    query_cameras().unwrap_or_default()
 }
 
 /// Turn `--index` / `--name` / `--id` into a position in `entries`.
@@ -293,6 +305,35 @@ fn camera_names(entries: &[CameraEntry]) -> String {
         .map(|entry| entry.name.as_str())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Same devices, same order, same names.
+fn same_cameras(left: &[CameraEntry], right: &[CameraEntry]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(a, b)| a.id == b.id && a.name == b.name)
+}
+
+/// Replace the device list, keeping `selected` on the same camera. Positions
+/// shift when a device appears or disappears, so matching by id is the only
+/// stable link. Returns true when the list actually changed.
+fn apply_refresh(
+    entries: &mut Vec<CameraEntry>,
+    selected: &mut usize,
+    fresh: Vec<CameraEntry>,
+) -> bool {
+    if same_cameras(entries, &fresh) {
+        return false;
+    }
+
+    let live = entries.get(*selected).cloned();
+    *entries = fresh;
+    *selected = live
+        .and_then(|entry| entries.iter().position(|other| other.id == entry.id))
+        .unwrap_or(usize::MAX);
+    true
 }
 
 /// Every `(resolution, pixel format, frame rate)` triple the device offers.
@@ -440,11 +481,13 @@ fn describe(camera: &Camera) -> String {
 
 /// Open the camera, capture a handful of frames, report what happened and save
 /// one PNG. Useful to check permissions and real throughput without a window.
+/// A camera that stops answering makes this fail instead of hanging.
 fn probe_camera(target: &CameraIndex, args: &Args) -> Result<()> {
-    let mut camera = open_camera(target, args)?;
-    println!("Negotiated format: {}", describe(&camera));
+    let (feed, _, _) = open_and_spawn(target, args)?;
 
     const FRAMES: u32 = 20;
+    const BUDGET: Duration = Duration::from_secs(10);
+
     let mut frames = 0u32;
     let mut luma_sum = 0f64;
     let mut capture_time = Duration::ZERO;
@@ -453,10 +496,30 @@ fn probe_camera(target: &CameraIndex, args: &Args) -> Result<()> {
     let (mut width, mut height) = (0usize, 0usize);
 
     let started = Instant::now();
-    for _ in 0..FRAMES {
+    while frames < FRAMES {
+        if started.elapsed() >= BUDGET {
+            bail!(
+                "the camera delivered {frames}/{FRAMES} frames in {} s — it may be \
+                 busy, blocked or disconnected",
+                BUDGET.as_secs()
+            );
+        }
+
         let t0 = Instant::now();
-        let frame = camera.frame().context("capture failed")?;
+        let received = match feed.next_frame() {
+            Ok(received) => received,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => bail!("the capture thread stopped"),
+        };
         capture_time += t0.elapsed();
+
+        let frame = match received {
+            Ok(frame) => frame,
+            Err(err) => {
+                eprintln!("capture error: {err}");
+                continue;
+            }
+        };
 
         let t1 = Instant::now();
         let decoded = frame.decode_image::<RgbFormat>().context("decode failed")?;
@@ -475,6 +538,7 @@ fn probe_camera(target: &CameraIndex, args: &Args) -> Result<()> {
             frames += 1;
         }
     }
+    feed.shutdown();
     let elapsed = started.elapsed().as_secs_f32();
 
     println!(
@@ -766,6 +830,14 @@ impl Feed {
         }
     }
 
+    /// Drop the worker without waiting: used when the device is already gone,
+    /// so there is nothing left to release.
+    fn abandon(self) {
+        let Self { frames, stop, .. } = self;
+        stop.store(true, Ordering::Relaxed);
+        drop(frames);
+    }
+
     /// Ask the worker to finish, giving up on it if the camera call never
     /// returns (an unplugged device keeps the worker blocked forever).
     fn shutdown(self) {
@@ -1014,6 +1086,11 @@ fn main() -> Result<()> {
     // Camera we switched away from: the first candidate if the current one dies.
     let mut previous: Option<String> = None;
     let mut last_frame_at = Instant::now();
+    let mut frames_from_feed = 0u32;
+    let mut last_refresh_at = Instant::now();
+    // A device list that differs for a single poll is not trusted: flaky
+    // devices flap in and out, and every rebuild redraws the menu bar.
+    let mut pending_entries: Option<Vec<CameraEntry>> = None;
     let mut next_attempt_at = Instant::now();
     let mut first_attempt = true;
 
@@ -1065,6 +1142,7 @@ fn main() -> Result<()> {
                         redraw = true;
                         menu_changed = true;
                         last_frame_at = Instant::now();
+                        frames_from_feed = 0;
                     }
                 }
                 _ => {}
@@ -1087,6 +1165,7 @@ fn main() -> Result<()> {
         }
 
         let mut lost = false;
+        let mut lost_name: Option<String> = None;
 
         if !frozen {
             if let Some(current) = feed.as_ref() {
@@ -1099,6 +1178,7 @@ fn main() -> Result<()> {
                 match received {
                     Ok(Ok(frame)) => {
                         last_frame_at = Instant::now();
+                        frames_from_feed += 1;
                         let t = Instant::now();
                         let decoded = frame.decode_image::<RgbFormat>();
                         stage.decode = t.elapsed();
@@ -1133,7 +1213,14 @@ fn main() -> Result<()> {
                         eprintln!("capture error: {err}");
                     }
                     Err(RecvTimeoutError::Timeout) => {
-                        if last_frame_at.elapsed() >= STALL_TIMEOUT {
+                        // A camera that never delivered anything gets more time
+                        // to spin up than one that was working.
+                        let grace = if frames_from_feed == 0 {
+                            STARTUP_TIMEOUT
+                        } else {
+                            STALL_TIMEOUT
+                        };
+                        if last_frame_at.elapsed() >= grace {
                             lost = true;
                         }
                     }
@@ -1146,18 +1233,64 @@ fn main() -> Result<()> {
             }
         }
 
+        // Hot-plug and unplug: re-read the device list (well under a
+        // millisecond) so cameras connected while the program is running reach
+        // the menu, and a removed one is noticed without waiting for a stall.
+        if last_refresh_at.elapsed() >= REFRESH_INTERVAL {
+            last_refresh_at = Instant::now();
+            if let Ok(fresh) = query_cameras() {
+                let live = entries.get(selected).cloned();
+                let listed = live
+                    .as_ref()
+                    .is_some_and(|entry| fresh.iter().any(|other| other.id == entry.id));
+
+                if same_cameras(&entries, &fresh) {
+                    pending_entries = None;
+                } else if pending_entries
+                    .as_ref()
+                    .is_some_and(|pending| same_cameras(pending, &fresh))
+                {
+                    // Same change twice in a row: it is real.
+                    pending_entries = None;
+                    if apply_refresh(&mut entries, &mut selected, fresh) {
+                        menu_changed = true;
+                    }
+                } else {
+                    pending_entries = Some(fresh);
+                }
+
+                // A camera that left the list and went silent is gone: no point
+                // waiting for the stall timer. Frames still arriving win, so a
+                // device that merely blinked out of the list keeps streaming.
+                if let Some(entry) = live {
+                    if !frozen
+                        && feed.is_some()
+                        && !listed
+                        && last_frame_at.elapsed() >= REMOVAL_GRACE
+                    {
+                        lost = true;
+                        lost_name = Some(entry.name);
+                    }
+                }
+            }
+        }
+
         if lost {
-            let name = entries
-                .get(selected)
-                .map(|entry| entry.name.clone())
+            let name = lost_name
+                .or_else(|| entries.get(selected).map(|entry| entry.name.clone()))
                 .unwrap_or_else(|| "camera".to_string());
-            eprintln!("camera lost: {name}");
+            eprintln!(
+                "camera lost: {name} (no frames for {:.1} s)",
+                last_frame_at.elapsed().as_secs_f32()
+            );
             if let Some(dead) = feed.take() {
-                dead.shutdown();
+                // The device is gone; do not wait for it to release anything.
+                dead.abandon();
             }
             // Forget which entry is live; the menu should not claim one is.
             selected = usize::MAX;
             consecutive_errors = 0;
+            frames_from_feed = 0;
             first_attempt = true;
             next_attempt_at = Instant::now();
         }
@@ -1176,6 +1309,7 @@ fn main() -> Result<()> {
                     redraw = true;
                     menu_changed = true;
                     last_frame_at = Instant::now();
+                    frames_from_feed = 0;
                     consecutive_errors = 0;
                 }
                 None => {
@@ -1210,6 +1344,9 @@ fn main() -> Result<()> {
             }
         }
 
+        // Hot-plug: re-read the device list so a camera connected while the
+        // program is running shows up in the menu. Only touch the menu when
+        // something actually changed, so an open menu is not closed for nothing.
         if menu_changed {
             install_menu(
                 &mut window,
@@ -1247,10 +1384,13 @@ fn main() -> Result<()> {
                 stats.report_if_due();
             }
 
-            // One-shot hint if the pipeline cannot keep up.
+            // One-shot hint if the pipeline cannot keep up. Ignore the first
+            // seconds, and the first frames of a freshly opened camera, whose
+            // loop time still includes the opening handshake.
             if !warned_slow
                 && measured_fps > 0.0
                 && measured_fps < 15.0
+                && frames_from_feed >= 20
                 && run_started.elapsed() > Duration::from_secs(2)
             {
                 warned_slow = true;
@@ -1444,5 +1584,60 @@ mod selection_tests {
             ..Args::default()
         };
         assert!(resolve_selection(&args, &list).is_err());
+    }
+
+    #[test]
+    fn refresh_ignores_an_unchanged_list() {
+        let mut list = entries(&[("FaceTime HD Camera", "a"), ("USB Camera", "b")]);
+        let mut selected = 1;
+        assert!(!apply_refresh(
+            &mut list,
+            &mut selected,
+            entries(&[("FaceTime HD Camera", "a"), ("USB Camera", "b")])
+        ));
+        assert_eq!(selected, 1);
+    }
+
+    #[test]
+    fn refresh_follows_the_camera_when_positions_shift() {
+        let mut list = entries(&[("FaceTime HD Camera", "a"), ("USB Camera", "b")]);
+        let mut selected = 1;
+        // A new device shows up in front of the list.
+        assert!(apply_refresh(
+            &mut list,
+            &mut selected,
+            entries(&[
+                ("iPhone Camera", "c"),
+                ("FaceTime HD Camera", "a"),
+                ("USB Camera", "b")
+            ])
+        ));
+        assert_eq!(list[selected].id, "b");
+        assert_eq!(selected, 2);
+    }
+
+    #[test]
+    fn refresh_drops_the_selection_when_the_camera_disappears() {
+        let mut list = entries(&[("FaceTime HD Camera", "a"), ("USB Camera", "b")]);
+        let mut selected = 1;
+        assert!(apply_refresh(
+            &mut list,
+            &mut selected,
+            entries(&[("FaceTime HD Camera", "a")])
+        ));
+        assert_eq!(selected, usize::MAX);
+        assert_eq!(list.len(), 1);
+    }
+
+    #[test]
+    fn refresh_leaves_an_empty_selection_alone() {
+        let mut list = Vec::new();
+        let mut selected = usize::MAX;
+        assert!(apply_refresh(
+            &mut list,
+            &mut selected,
+            entries(&[("FaceTime HD Camera", "a")])
+        ));
+        assert_eq!(selected, usize::MAX);
     }
 }

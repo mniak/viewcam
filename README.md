@@ -88,18 +88,19 @@ its aspect ratio.
 
 ## What happens when a camera disappears
 
-If the current camera stops delivering frames — unplugged USB camera, an iPhone
-leaving Continuity, a driver that stopped answering — the program notices within
-about three seconds and:
+The device list is re-read every 500 ms, and a stream that goes silent for a
+second also counts as dead. When the current camera stops delivering frames —
+unplugged USB camera, an iPhone leaving Continuity, a driver that stopped
+answering — the program notices within about half a second and:
 
 1. drops the dead camera;
-2. looks at the devices again;
-3. reopens the camera you came from, or any other camera it finds;
-4. retries every two seconds while none is available, then reconnects on its
+2. reopens the camera you came from, or any other camera it finds;
+3. retries every two seconds while none is available, then reconnects on its
    own when a camera is plugged back in.
 
-The window keeps repainting the last frame the whole time, so the program never
-freezes. The menu's `Camera` list is refreshed after each change.
+Cameras connected while the program is running show up in the `Camera` menu
+within about a second; nothing needs to be restarted. The window keeps repainting
+the last frame the whole time, so the program never freezes.
 
 This works because capture runs on its own thread. `nokhwa`'s `frame()` blocks on
 a channel that AVFoundation only feeds while the device is alive: after an unplug
@@ -163,6 +164,14 @@ binary in System Settings → Privacy & Security → Camera, then start it again
 **The camera was unplugged.** Nothing to do: the program returns to the previous
 camera (or any other it finds) and keeps retrying. If the window says `no
 camera`, plug one back in and it reconnects by itself.
+
+**A camera connected while the program runs.** It appears in the `View → Camera`
+menu within about a second; pick it there.
+
+**`--probe` gives up after ten seconds.** That camera delivered no frame at all.
+It is probably held by another program, or the permission was denied; the usual
+`viewcam --stats` will show the same after declaring the camera lost and falling
+back.
 
 **Low frame rate.** Run `viewcam --stats` to see where the time goes. If capture
 already takes ~66 ms per frame, the camera or the lighting is the limit. If
