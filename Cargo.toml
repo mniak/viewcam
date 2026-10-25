@@ -16,3 +16,11 @@ nokhwa-bindings-macos = "0.2.4"
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# A webcam pipeline is a tight pixel loop: unoptimized builds run at ~5 fps.
+# Keep `cargo run` usable by optimizing dependencies fully and our code lightly.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

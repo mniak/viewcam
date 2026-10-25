@@ -33,6 +33,8 @@ struct Args {
     probe: bool,
     formats: bool,
     mirror: bool,
+    stats: bool,
+    bench: bool,
     width: u32,
     height: u32,
     fps: u32,
@@ -48,6 +50,8 @@ impl Default for Args {
             probe: false,
             formats: false,
             mirror: true,
+            stats: false,
+            bench: false,
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
             fps: DEFAULT_FPS,
@@ -65,6 +69,8 @@ impl Args {
                 "-l" | "--list" => args.list = true,
                 "--probe" => args.probe = true,
                 "--formats" => args.formats = true,
+                "--stats" => args.stats = true,
+                "--bench" => args.bench = true,
                 "-m" | "--mirror" => args.mirror = true,
                 "--no-mirror" => args.mirror = false,
                 "-h" | "--help" => {
@@ -128,6 +134,8 @@ OPTIONS:
     -l, --list          List the cameras detected by the system and exit
         --formats       List the formats supported by the chosen camera and exit
         --probe         Capture ~20 frames, print stats and a PNG, then exit
+        --bench         Run a synthetic test pattern for 5 s and report GUI speed
+        --stats         Print per-stage timings every second while running
     -i, --index <N>     Camera to open (default: 0)
     -n, --name <TEXT>   Open the first camera whose name contains TEXT
         --id <ID>       Open a camera by its system id (see --list)
@@ -533,6 +541,138 @@ fn save_snapshot_as(
 }
 
 // ---------------------------------------------------------------------------
+// Diagnostics
+// ---------------------------------------------------------------------------
+
+/// Time spent in each stage of one frame.
+#[derive(Default, Clone, Copy)]
+struct Stages {
+    capture: Duration,
+    decode: Duration,
+    convert: Duration,
+    present: Duration,
+}
+
+/// Rolling per-stage averages, printed once per second by `--stats`.
+#[derive(Default)]
+struct StageStats {
+    since: Option<Instant>,
+    frames: u32,
+    total: Stages,
+}
+
+impl StageStats {
+    fn record(&mut self, stages: Stages) {
+        self.since.get_or_insert_with(Instant::now);
+        self.frames += 1;
+        self.total.capture += stages.capture;
+        self.total.decode += stages.decode;
+        self.total.convert += stages.convert;
+        self.total.present += stages.present;
+    }
+
+    fn report_if_due(&mut self) {
+        let Some(since) = self.since else { return };
+        let elapsed = since.elapsed();
+        if elapsed < Duration::from_secs(1) || self.frames == 0 {
+            return;
+        }
+
+        let n = f64::from(self.frames);
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0 / n;
+        println!(
+            "fps {:5.1} | capture {:5.1} ms | decode {:5.1} ms | convert {:4.1} ms | present {:5.1} ms",
+            f64::from(self.frames) / elapsed.as_secs_f64(),
+            ms(self.total.capture),
+            ms(self.total.decode),
+            ms(self.total.convert),
+            ms(self.total.present),
+        );
+
+        *self = StageStats::default();
+    }
+}
+
+fn make_window(width: usize, height: usize) -> Result<Window> {
+    let mut window = Window::new(
+        "viewcam",
+        width.max(320),
+        height.max(240),
+        WindowOptions {
+            resize: true,
+            scale_mode: ScaleMode::AspectRatioStretch,
+            ..WindowOptions::default()
+        },
+    )
+    .context("could not create the window")?;
+    // Never sleep between frames: we are already paced by the camera.
+    window.set_target_fps(0);
+    Ok(window)
+}
+
+/// A moving gradient, so every frame is genuinely different.
+fn fill_test_pattern(rgb: &mut [u8], width: usize, height: usize, tick: u8) {
+    for y in 0..height {
+        let green = (y * 255 / height.max(1)) as u8;
+        for x in 0..width {
+            let i = (y * width + x) * 3;
+            rgb[i] = (x * 255 / width.max(1)) as u8;
+            rgb[i + 1] = green;
+            rgb[i + 2] = tick;
+        }
+    }
+}
+
+/// Measure the GUI half of the pipeline with no camera involved.
+fn bench_gui(args: &Args) -> Result<()> {
+    let width = args.width as usize;
+    let height = args.height as usize;
+    let mut window = make_window(width, height)?;
+
+    let mut rgb = vec![0u8; width * height * 3];
+    let mut pixels = vec![0u32; width * height];
+    let mut frames = 0u32;
+    let mut convert = Duration::ZERO;
+    let mut present = Duration::ZERO;
+
+    println!(
+        "Benchmark: {width}x{height}, {:.2} MP/frame, window {:?}",
+        (width * height) as f64 / 1e6,
+        window.get_size()
+    );
+
+    let started = Instant::now();
+    while window.is_open() && started.elapsed() < Duration::from_secs(5) {
+        fill_test_pattern(&mut rgb, width, height, frames as u8);
+
+        let t = Instant::now();
+        blit_rgb_to_pixels(&rgb, &mut pixels, width, args.mirror);
+        convert += t.elapsed();
+
+        let t = Instant::now();
+        window.update_with_buffer(&pixels, width, height)?;
+        present += t.elapsed();
+
+        frames += 1;
+    }
+
+    let elapsed = started.elapsed().as_secs_f64();
+    let n = f64::from(frames.max(1));
+    println!(
+        "{frames} frames in {elapsed:.2}s = {:.1} fps",
+        f64::from(frames) / elapsed
+    );
+    println!(
+        "per frame: convert {:.1} ms, present {:.1} ms, total {:.1} ms",
+        convert.as_secs_f64() * 1000.0 / n,
+        present.as_secs_f64() * 1000.0 / n,
+        (convert + present).as_secs_f64() * 1000.0 / n,
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Main loop
 // ---------------------------------------------------------------------------
 
@@ -541,6 +681,9 @@ fn main() -> Result<()> {
 
     if args.list {
         return list_cameras();
+    }
+    if args.bench {
+        return bench_gui(&args);
     }
 
     let target = resolve_target(&args)?;
@@ -566,18 +709,7 @@ fn main() -> Result<()> {
     }
     println!("Keys: Esc/Q quit · M mirror · S snapshot · Space freeze");
 
-    let mut window = Window::new(
-        "viewcam",
-        width.max(320),
-        height.max(240),
-        WindowOptions {
-            resize: true,
-            scale_mode: ScaleMode::AspectRatioStretch,
-            ..WindowOptions::default()
-        },
-    )
-    .context("could not create the window")?;
-    window.set_target_fps(0);
+    let mut window = make_window(width, height)?;
 
     let mut mirror = args.mirror;
     let mut frozen = false;
@@ -587,8 +719,15 @@ fn main() -> Result<()> {
     let mut redraw = true;
     let mut consecutive_errors = 0u32;
     let mut measured_fps = 0f32;
+    let mut stats = StageStats::default();
+    let mut warned_slow = false;
+    let run_started = Instant::now();
+    let mut title_at = Instant::now();
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
+        let loop_started = Instant::now();
+        let mut stage = Stages::default();
+
         if window.is_key_pressed(Key::Q, KeyRepeat::No) {
             break;
         }
@@ -602,40 +741,42 @@ fn main() -> Result<()> {
         }
 
         if !frozen {
-            let started = Instant::now();
-            match camera.frame() {
-                Ok(frame) => match frame.decode_image::<RgbFormat>() {
-                    Ok(decoded) => {
-                        consecutive_errors = 0;
-                        let (w, h) = (decoded.width() as usize, decoded.height() as usize);
+            let t = Instant::now();
+            let captured = camera.frame();
+            stage.capture = t.elapsed();
 
-                        if (w, h) != (width, height) {
-                            width = w;
-                            height = h;
-                            pixels = vec![0; width * height];
+            match captured {
+                Ok(frame) => {
+                    let t = Instant::now();
+                    let decoded = frame.decode_image::<RgbFormat>();
+                    stage.decode = t.elapsed();
+
+                    match decoded {
+                        Ok(decoded) => {
+                            consecutive_errors = 0;
+                            let (w, h) = (decoded.width() as usize, decoded.height() as usize);
+
+                            if (w, h) != (width, height) {
+                                width = w;
+                                height = h;
+                                pixels = vec![0; width * height];
+                            }
+
+                            let t = Instant::now();
+                            let rgb = decoded.into_raw();
+                            blit_rgb_to_pixels(&rgb, &mut pixels, width, mirror);
+                            stage.convert = t.elapsed();
+
+                            snapshot_rgb = rgb;
+                            have_frame = true;
+                            redraw = true;
                         }
-
-                        let rgb = decoded.into_raw();
-                        blit_rgb_to_pixels(&rgb, &mut pixels, width, mirror);
-                        snapshot_rgb = rgb;
-                        have_frame = true;
-                        redraw = true;
-
-                        let elapsed = started.elapsed().as_secs_f32();
-                        if elapsed > 0.0 {
-                            let instant = 1.0 / elapsed;
-                            measured_fps = if measured_fps == 0.0 {
-                                instant
-                            } else {
-                                measured_fps * 0.9 + instant * 0.1
-                            };
+                        Err(err) => {
+                            consecutive_errors += 1;
+                            eprintln!("decode error: {err}");
                         }
                     }
-                    Err(err) => {
-                        consecutive_errors += 1;
-                        eprintln!("decode error: {err}");
-                    }
-                },
+                }
                 Err(err) => {
                     consecutive_errors += 1;
                     eprintln!("capture error: {err}");
@@ -658,21 +799,64 @@ fn main() -> Result<()> {
         }
 
         if redraw && have_frame {
+            let t = Instant::now();
             window
                 .update_with_buffer(&pixels, width, height)
                 .context("could not update the window")?;
+            stage.present = t.elapsed();
             redraw = false;
 
-            window.set_title(&format!(
-                "viewcam — {width}x{height} — {measured_fps:.0} fps — {}",
-                if frozen {
-                    "frozen"
-                } else if mirror {
-                    "mirrored"
+            // End-to-end rate: capture + decode + convert + present.
+            let elapsed = loop_started.elapsed().as_secs_f32();
+            if elapsed > 0.0 {
+                let instant = 1.0 / elapsed;
+                measured_fps = if measured_fps == 0.0 {
+                    instant
                 } else {
-                    "live"
+                    measured_fps * 0.9 + instant * 0.1
+                };
+            }
+
+            // The title bar is a macOS window property: updating it at camera
+            // rate makes the window server redraw it 30 times a second.
+            if title_at.elapsed() >= Duration::from_millis(500) {
+                title_at = Instant::now();
+                window.set_title(&format!(
+                    "viewcam — {width}x{height} — {measured_fps:.0} fps — {}",
+                    if frozen {
+                        "frozen"
+                    } else if mirror {
+                        "mirrored"
+                    } else {
+                        "live"
+                    }
+                ));
+            }
+
+            if args.stats {
+                stats.record(stage);
+                stats.report_if_due();
+            }
+
+            // One-shot hint if the pipeline cannot keep up.
+            if !warned_slow
+                && measured_fps > 0.0
+                && measured_fps < 15.0
+                && run_started.elapsed() > Duration::from_secs(2)
+            {
+                warned_slow = true;
+                if cfg!(debug_assertions) {
+                    println!(
+                        "hint: only {measured_fps:.0} fps — this is an unoptimized build, \
+                         `cargo run --release` is much faster"
+                    );
+                } else {
+                    println!(
+                        "hint: only {measured_fps:.0} fps — run with --stats to see whether \
+                         capture or decode is the limit"
+                    );
                 }
-            ));
+            }
         } else {
             // No new frame (frozen or waiting): keep window events flowing.
             window.update();
