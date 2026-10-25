@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
-use minifb::{Key, KeyRepeat, ScaleMode, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, Menu, MenuHandle, ScaleMode, Window, WindowOptions};
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::query;
 use nokhwa::utils::{
@@ -151,6 +151,11 @@ KEYS (while the window has focus):
     M                   Toggle mirror
     S                   Save a PNG snapshot to ./snapshots
     Space               Freeze / resume the image
+
+MENU BAR:
+    View → Mirror       Turn the mirror effect on or off
+    View → Camera       Switch to another camera while running
+    View → Freeze / Save snapshot / Quit
 "
     );
 }
@@ -188,23 +193,43 @@ fn list_cameras() -> Result<()> {
     Ok(())
 }
 
-/// Turn `--index` / `--name` / `--id` into a stable [`CameraIndex`].
+/// A camera as offered by the backend: display name plus the stable system id.
+struct CameraEntry {
+    name: String,
+    id: String,
+}
+
+/// Cameras in the order the backend reports them; empty if the query fails.
+fn camera_entries() -> Vec<CameraEntry> {
+    query(ApiBackend::Auto)
+        .map(|cameras| {
+            cameras
+                .into_iter()
+                .map(|info| CameraEntry {
+                    name: info.human_name(),
+                    id: info.misc(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Turn `--index` / `--name` / `--id` into a position in `entries`.
 ///
 /// Numeric indices shift when devices appear or disappear (a Continuity iPhone
-/// camera, a USB camera being plugged), so the system id is used whenever we
-/// can resolve one.
-fn resolve_target(args: &Args) -> Result<CameraIndex> {
-    let cameras = query(ApiBackend::Auto).context("could not query the camera backend")?;
-
+/// camera, a USB camera being plugged), so the system id is what we actually
+/// open with.
+fn resolve_selection(args: &Args, entries: &[CameraEntry]) -> Result<usize> {
     if let Some(id) = &args.id {
-        let found = cameras.iter().any(|info| &info.misc() == id);
-        if !found {
-            bail!("no camera with id {id:?}; run `viewcam --list` to see the ids");
-        }
-        return Ok(CameraIndex::String(id.clone()));
+        return entries
+            .iter()
+            .position(|entry| &entry.id == id)
+            .ok_or_else(|| {
+                anyhow!("no camera with id {id:?}; run `viewcam --list` to see the ids")
+            });
     }
 
-    if cameras.is_empty() {
+    if entries.is_empty() {
         bail!(
             "no camera was found — check that it is connected and that the \
              application running viewcam may use the camera"
@@ -213,42 +238,42 @@ fn resolve_target(args: &Args) -> Result<CameraIndex> {
 
     if let Some(name) = &args.name {
         let needle = name.to_lowercase();
-        let matches = cameras
+        let matches = entries
             .iter()
-            .filter(|info| info.human_name().to_lowercase().contains(&needle))
+            .enumerate()
+            .filter(|(_, entry)| entry.name.to_lowercase().contains(&needle))
+            .map(|(position, _)| position)
             .collect::<Vec<_>>();
 
         return match matches.as_slice() {
             [] => bail!(
                 "no camera name contains {name:?}; available: {}",
-                camera_names(&cameras)
+                camera_names(entries)
             ),
-            [only] => Ok(CameraIndex::String(only.misc().to_string())),
+            [only] => Ok(*only),
             many => bail!(
                 "{} cameras match {name:?}: {} — use --index",
                 many.len(),
-                camera_names(&cameras)
+                camera_names(entries)
             ),
         };
     }
 
     let wanted = args.index.unwrap_or(0) as usize;
-    cameras.get(wanted).map_or_else(
-        || {
-            bail!(
-                "camera index {wanted} does not exist ({} camera(s) found: {})",
-                cameras.len(),
-                camera_names(&cameras)
-            )
-        },
-        |info| Ok(CameraIndex::String(info.misc().to_string())),
-    )
+    if wanted >= entries.len() {
+        bail!(
+            "camera index {wanted} does not exist ({} camera(s) found: {})",
+            entries.len(),
+            camera_names(entries)
+        );
+    }
+    Ok(wanted)
 }
 
-fn camera_names(cameras: &[nokhwa::utils::CameraInfo]) -> String {
-    cameras
+fn camera_names(entries: &[CameraEntry]) -> String {
+    entries
         .iter()
-        .map(|info| info.human_name())
+        .map(|entry| entry.name.as_str())
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -673,6 +698,121 @@ fn bench_gui(args: &Args) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Menu
+// ---------------------------------------------------------------------------
+
+const MENU_MIRROR: usize = 1;
+const MENU_FREEZE: usize = 2;
+const MENU_SNAPSHOT: usize = 3;
+const MENU_QUIT: usize = 4;
+/// Camera items use `MENU_CAMERA_BASE + position`.
+const MENU_CAMERA_BASE: usize = 100;
+
+// Commands must never overlap the camera id range.
+const _: () = assert!(MENU_CAMERA_BASE > MENU_QUIT);
+
+/// Rebuilding the menu is the only way to refresh its labels (minifb cannot
+/// change the text of an existing item), so the state lives in the caller.
+fn build_menu(
+    entries: &[CameraEntry],
+    selected: usize,
+    mirror: bool,
+    frozen: bool,
+) -> Result<Menu> {
+    let mut menu = Menu::new("View")?;
+
+    menu.add_item(
+        if mirror { "Mirror: on" } else { "Mirror: off" },
+        MENU_MIRROR,
+    )
+    .build();
+
+    let mut camera_menu = Menu::new("Camera")?;
+    if entries.is_empty() {
+        camera_menu
+            .add_item("No camera found", MENU_CAMERA_BASE)
+            .enabled(false)
+            .build();
+    } else {
+        for (position, entry) in entries.iter().enumerate() {
+            // minifb exposes no check mark, so the current one is marked here.
+            let label = if position == selected {
+                format!("• {}", entry.name)
+            } else {
+                format!("   {}", entry.name)
+            };
+            camera_menu
+                .add_item(&label, MENU_CAMERA_BASE + position)
+                .build();
+        }
+    }
+    menu.add_sub_menu("Camera", &camera_menu);
+
+    menu.add_separator();
+    menu.add_item(if frozen { "Resume" } else { "Freeze" }, MENU_FREEZE)
+        .build();
+    menu.add_item("Save snapshot", MENU_SNAPSHOT).build();
+    menu.add_separator();
+    menu.add_item("Quit", MENU_QUIT).build();
+
+    Ok(menu)
+}
+
+fn install_menu(
+    window: &mut Window,
+    handle: &mut Option<MenuHandle>,
+    entries: &[CameraEntry],
+    selected: usize,
+    mirror: bool,
+    frozen: bool,
+) {
+    if let Some(old) = handle.take() {
+        window.remove_menu(old);
+    }
+    match build_menu(entries, selected, mirror, frozen) {
+        Ok(menu) => *handle = Some(window.add_menu(&menu)),
+        Err(err) => eprintln!("could not build the menu: {err:#}"),
+    }
+}
+
+/// Open another camera, keeping the current one if the new device fails.
+fn switch_camera(
+    position: usize,
+    entries: &[CameraEntry],
+    selected: &mut usize,
+    args: &Args,
+    camera: &mut Camera,
+) -> Option<(usize, usize)> {
+    let entry = entries.get(position)?;
+    if position == *selected {
+        return None;
+    }
+
+    let target = CameraIndex::String(entry.id.clone());
+    match open_camera(&target, args) {
+        Ok(new_camera) => {
+            *camera = new_camera;
+            *selected = position;
+
+            let format = camera.camera_format();
+            println!(
+                "Camera now: {} — {}x{} @{} fps ({})",
+                entry.name,
+                format.width(),
+                format.height(),
+                format.frame_rate(),
+                format.format()
+            );
+            Some((format.width() as usize, format.height() as usize))
+        }
+        Err(err) => {
+            eprintln!("could not switch to {}: {err:#}", entry.name);
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main loop
 // ---------------------------------------------------------------------------
 
@@ -686,7 +826,9 @@ fn main() -> Result<()> {
         return bench_gui(&args);
     }
 
-    let target = resolve_target(&args)?;
+    let entries = camera_entries();
+    let mut selected = resolve_selection(&args, &entries)?;
+    let target = CameraIndex::String(entries[selected].id.clone());
 
     if args.formats {
         return print_formats(&target, &args);
@@ -708,13 +850,15 @@ fn main() -> Result<()> {
         );
     }
     println!("Keys: Esc/Q quit · M mirror · S snapshot · Space freeze");
+    println!("The menu bar has the same options, including a camera picker.");
 
     let mut window = make_window(width, height)?;
 
     let mut mirror = args.mirror;
     let mut frozen = false;
     let mut pixels: Vec<u32> = vec![0; width * height];
-    let mut snapshot_rgb: Vec<u8> = Vec::new();
+    // Last decoded frame, kept so a mirror toggle can repaint a frozen image.
+    let mut frame_rgb: Vec<u8> = Vec::new();
     let mut have_frame = false;
     let mut redraw = true;
     let mut consecutive_errors = 0u32;
@@ -723,20 +867,72 @@ fn main() -> Result<()> {
     let mut warned_slow = false;
     let run_started = Instant::now();
     let mut title_at = Instant::now();
+    let mut menu_handle: Option<MenuHandle> = None;
+
+    install_menu(
+        &mut window,
+        &mut menu_handle,
+        &entries,
+        selected,
+        mirror,
+        frozen,
+    );
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let loop_started = Instant::now();
         let mut stage = Stages::default();
+        let mut menu_changed = false;
+        let mut mirror_changed = false;
+        let mut snapshot_requested = false;
+
+        // Menu bar: one click per event.
+        while let Some(id) = window.is_menu_pressed() {
+            match id {
+                MENU_MIRROR => {
+                    mirror = !mirror;
+                    mirror_changed = true;
+                    menu_changed = true;
+                    redraw = true;
+                }
+                MENU_FREEZE => {
+                    frozen = !frozen;
+                    menu_changed = true;
+                }
+                MENU_SNAPSHOT => snapshot_requested = true,
+                MENU_QUIT => return Ok(()),
+                id if id >= MENU_CAMERA_BASE => {
+                    if let Some((new_width, new_height)) = switch_camera(
+                        id - MENU_CAMERA_BASE,
+                        &entries,
+                        &mut selected,
+                        &args,
+                        &mut camera,
+                    ) {
+                        width = new_width;
+                        height = new_height;
+                        pixels = vec![0; width * height];
+                        frame_rgb.clear();
+                        have_frame = false;
+                        redraw = true;
+                        menu_changed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
 
         if window.is_key_pressed(Key::Q, KeyRepeat::No) {
             break;
         }
         if window.is_key_pressed(Key::M, KeyRepeat::No) {
             mirror = !mirror;
+            mirror_changed = true;
+            menu_changed = true;
             redraw = true;
         }
         if window.is_key_pressed(Key::Space, KeyRepeat::No) {
             frozen = !frozen;
+            menu_changed = true;
             println!("{}", if frozen { "Frozen" } else { "Live" });
         }
 
@@ -763,11 +959,10 @@ fn main() -> Result<()> {
                             }
 
                             let t = Instant::now();
-                            let rgb = decoded.into_raw();
-                            blit_rgb_to_pixels(&rgb, &mut pixels, width, mirror);
+                            frame_rgb = decoded.into_raw();
+                            blit_rgb_to_pixels(&frame_rgb, &mut pixels, width, mirror);
                             stage.convert = t.elapsed();
 
-                            snapshot_rgb = rgb;
                             have_frame = true;
                             redraw = true;
                         }
@@ -789,13 +984,32 @@ fn main() -> Result<()> {
             }
         }
 
-        if window.is_key_pressed(Key::S, KeyRepeat::No) && have_frame {
+        // A frozen frame must still follow the mirror setting.
+        if frozen && mirror_changed && have_frame && !frame_rgb.is_empty() {
+            let t = Instant::now();
+            blit_rgb_to_pixels(&frame_rgb, &mut pixels, width, mirror);
+            stage.convert = t.elapsed();
+        }
+
+        if (snapshot_requested || window.is_key_pressed(Key::S, KeyRepeat::No)) && have_frame {
             // Save what is on screen, so mirror mode is honoured.
+            let mut snapshot_rgb = Vec::new();
             pixels_to_rgb(&pixels, &mut snapshot_rgb);
             match save_snapshot(&snapshot_rgb, width, height) {
                 Ok(path) => println!("Snapshot saved to {}", path.display()),
                 Err(err) => eprintln!("snapshot failed: {err:#}"),
             }
+        }
+
+        if menu_changed {
+            install_menu(
+                &mut window,
+                &mut menu_handle,
+                &entries,
+                selected,
+                mirror,
+                frozen,
+            );
         }
 
         if redraw && have_frame {
@@ -951,5 +1165,70 @@ mod tests {
             CameraFormat::new(Resolution::new(0, 0), FrameFormat::YUYV, 30),
         ];
         assert!(pick_format(&formats, &args_for(1280, 720)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    fn entries(names: &[(&str, &str)]) -> Vec<CameraEntry> {
+        names
+            .iter()
+            .map(|(name, id)| CameraEntry {
+                name: (*name).to_string(),
+                id: (*id).to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn selects_by_position() {
+        let list = entries(&[("FaceTime HD Camera", "a"), ("USB Camera", "b")]);
+        let args = Args {
+            index: Some(1),
+            ..Args::default()
+        };
+        assert_eq!(resolve_selection(&args, &list).unwrap(), 1);
+    }
+
+    #[test]
+    fn selects_by_name_substring_case_insensitively() {
+        let list = entries(&[("FaceTime HD Camera", "a"), ("USB Camera", "b")]);
+        let args = Args {
+            name: Some("usb".to_string()),
+            ..Args::default()
+        };
+        assert_eq!(resolve_selection(&args, &list).unwrap(), 1);
+    }
+
+    #[test]
+    fn selects_by_id() {
+        let list = entries(&[("FaceTime HD Camera", "a"), ("USB Camera", "b")]);
+        let args = Args {
+            id: Some("b".to_string()),
+            ..Args::default()
+        };
+        assert_eq!(resolve_selection(&args, &list).unwrap(), 1);
+    }
+
+    #[test]
+    fn rejects_ambiguous_name() {
+        let list = entries(&[("USB Camera 1", "a"), ("USB Camera 2", "b")]);
+        let args = Args {
+            name: Some("usb".to_string()),
+            ..Args::default()
+        };
+        assert!(resolve_selection(&args, &list).is_err());
+    }
+
+    #[test]
+    fn rejects_out_of_range_position() {
+        let list = entries(&[("FaceTime HD Camera", "a")]);
+        let args = Args {
+            index: Some(5),
+            ..Args::default()
+        };
+        assert!(resolve_selection(&args, &list).is_err());
     }
 }

@@ -1,17 +1,15 @@
 # viewcam
 
 Real-time webcam viewer written in Rust. Frames are captured through the
-system's native API (AVFoundation on macOS, V4L2 on Linux, Media Foundation on
-Windows) and drawn in a lightweight window.
-
-![throughput](https://img.shields.io/badge/capture-~30%20fps%20at%201280x720-green)
+operating system's native API (AVFoundation on macOS, V4L2 on Linux, Media
+Foundation on Windows) and drawn in a lightweight window.
 
 ## Requirements
 
 - Stable Rust (tested with 1.99)
 - A webcam
-- On macOS, camera permission for the terminal/editor that runs the binary
-  (System Settings → Privacy & Security → Camera)
+- On macOS, camera permission for the terminal or editor that launches the
+  binary (System Settings → Privacy & Security → Camera)
 
 ## Build and run
 
@@ -21,8 +19,8 @@ cargo run --release
 
 The first build compiles the dependencies (`nokhwa` + `minifb`) and takes a few
 minutes. The development profile already optimizes dependencies (see
-`[profile.dev]` in `Cargo.toml`), so `cargo run` also reaches ~30 fps; the
-final binary lands in `target/release/viewcam`:
+`[profile.dev]` in `Cargo.toml`), so `cargo run` also runs at ~30 fps. The final
+binary lands in `target/release/viewcam`:
 
 ```sh
 ./target/release/viewcam
@@ -33,10 +31,10 @@ final binary lands in `target/release/viewcam`:
 ```text
 viewcam [OPTIONS] [INDEX]
 
--l, --list          List the cameras and exit
+-l, --list          List the cameras detected by the system and exit
     --formats       List the formats supported by the chosen camera and exit
-    --probe         Capture ~20 frames, print stats, save a PNG, then exit
-    --bench         Run a synthetic pattern for 5 s and measure the GUI only
+    --probe         Capture ~20 frames, print stats and a PNG, then exit
+    --bench         Run a synthetic test pattern for 5 s and report GUI speed
     --stats         Print per-stage timings every second while running
 -i, --index <N>     Camera to open (default: 0)
 -n, --name <TEXT>   Open the first camera whose name contains TEXT
@@ -46,25 +44,72 @@ viewcam [OPTIONS] [INDEX]
     --fps <N>       Preferred frame rate (default: 30)
 -m, --mirror        Start mirrored, like a mirror (default)
     --no-mirror     Start unmirrored
--h, --help          Show help
+-h, --help          Show this help
 ```
 
 Examples:
 
 ```sh
-viewcam --list                   # which cameras exist
-viewcam --name face              # the FaceTime HD Camera
-viewcam --formats -n face        # what that camera can deliver
-viewcam --probe -n face          # measure real fps and save snapshots/*.png
-viewcam --stats -n face          # capture/decode/convert/present timings
-viewcam --bench -W 2560 -H 1440  # measure the window alone, without a camera
-viewcam -W 1920 -H 1080          # ask for 1080p
+viewcam --list                     # which cameras exist
+viewcam --name face                # the FaceTime HD Camera
+viewcam --formats -n face          # what that camera can deliver
+viewcam --probe -n face            # measure real fps and write a PNG
+viewcam --stats -n face            # capture/decode/convert/present timings
+viewcam --bench -W 2560 -H 1440     # GUI only, no camera
+viewcam -W 1920 -H 1080             # ask for 1080p
 ```
+
+## Menu bar and keys
+
+The macOS menu bar exposes the same controls as the keyboard:
+
+| Menu item            | Effect                                            |
+| -------------------- | ------------------------------------------------- |
+| `View → Mirror: on/off` | Turns the mirror (selfie) effect on or off      |
+| `View → Camera → …`  | Switches to another camera while it is running     |
+| `View → Freeze`      | Freezes or resumes the image                       |
+| `View → Save snapshot` | Writes a PNG to `./snapshots`                    |
+| `View → Quit`        | Closes the program                                 |
+
+The current camera is marked with `•` in the `Camera` submenu. The menu bar
+belongs to the app, so it shows up when viewcam is the active application (click
+the video window if your terminal still owns the menu bar).
+
+| Key          | Effect                    |
+| ------------ | ------------------------- |
+| `Esc` / `Q`  | Quit                      |
+| `M`          | Toggle mirroring          |
+| `S`          | Save a PNG in `./snapshots` |
+| `Space`      | Freeze / resume the image |
+
+The window title shows resolution, measured fps and the current state (`live`,
+`mirrored`, `frozen`). The window can be resized; the image keeps its aspect
+ratio.
+
+## How the capture format is chosen
+
+The program asks the camera for its supported formats and picks the one closest
+to `--width/--height/--fps`, in this order of preference:
+
+1. never exceed the requested resolution (an accidental 4K stream is too slow);
+2. smallest distance to the requested resolution;
+3. frame rate ≥ 20 when available;
+4. MJPEG before YUYV, and both before NV12/GRAY.
+
+If the camera rejects the selected format, it falls back to the device default
+and says so on the console.
+
+This explicit step exists because `nokhwa` 0.10's `RequestedFormatType::Closest`
+looks the frame rate up under the *requested* resolution: when that resolution
+is not present exactly, the lookup fails and the library silently takes the
+first format in its list (sometimes 160x120@25). For the same reason the program
+uses `--name`/`--id`: numeric indices shift when a USB camera or a Continuity
+iPhone appears or disappears.
 
 ## Performance diagnostics
 
-Every frame goes through **capture → decode (YUYV/MJPEG → RGB) → bitmap
-conversion → window present**. `--stats` reports the cost of each stage:
+The path of every frame is **capture → decode (YUYV/MJPEG → RGB) → convert to
+bitmap → draw**. `--stats` reports the cost of each stage:
 
 ```text
 fps  30.9 | capture  25.1 ms | decode   5.5 ms | convert  1.7 ms | present  0.9 ms
@@ -72,81 +117,45 @@ fps  30.9 | capture  25.1 ms | decode   5.5 ms | convert  1.7 ms | present  0.9 
 
 Reference numbers measured on this machine (FaceTime HD, 1280x720@30):
 
-| Stage   | Cost   | Notes                                              |
-| ------- | ------ | -------------------------------------------------- |
-| capture | ~25 ms | waiting: the camera delivers 30 fps (33 ms/frame)  |
-| decode  | ~5 ms  | YUYV → RGB conversion (dev build: ~9 ms)           |
-| convert | ~1.7 ms| bitmap packing + mirroring                         |
-| present | ~1 ms  | OpenGL texture upload (composition is async)       |
+| Stage   | Cost   | Note                                                  |
+| ------- | ------ | ----------------------------------------------------- |
+| capture | ~25 ms | mostly waiting: the camera delivers 30 fps (33 ms/frame) |
+| decode  | ~5 ms  | YUYV → RGB conversion (about 9 ms in a dev build)      |
+| convert | ~1.7 ms| bitmap packing plus mirroring                          |
+| present | ~1 ms  | OpenGL texture upload (composition is asynchronous)    |
 
-`--bench` measures only the graphics side, without a camera: 1280x720 → 59 fps,
+`--bench` measures the GUI half alone, without a camera: 1280x720 → 59 fps,
 2560x1440 → 59 fps (capped by the 60 Hz vsync). The window is therefore not the
-bottleneck at that size; the realistic ceiling is the camera's own rate.
+bottleneck; the realistic ceiling is the camera's own frame rate.
 
-If `capture` sits far above `1000/camera_fps`, the camera is the limit (low
-light commonly drops webcams to 15 fps). If `decode` dominates, the build is
-running without optimization.
-
-### Keys
-
-| Key        | Action                          |
-| ---------- | ------------------------------- |
-| `Esc`/`Q`  | Quit                            |
-| `M`        | Toggle mirroring                |
-| `S`        | Save a PNG into `./snapshots`   |
-| `Space`    | Freeze / resume the image       |
-
-The window title shows resolution, measured fps and the current state (`live`,
-`mirrored`, `frozen`). The window is resizable and the image keeps its aspect
-ratio.
-
-## How the format is chosen
-
-The program asks the camera for its supported formats and picks the closest one
-to `--width/--height/--fps`, in this order of preference:
-
-1. never exceed the requested resolution (accidental 4K is too slow);
-2. smallest distance to the requested resolution;
-3. frame rate ≥ 20 when available;
-4. MJPEG before YUYV, and both before NV12/GRAY.
-
-If the camera rejects the chosen format, it falls back to the device default and
-says so on stdout.
-
-This explicit step exists because `nokhwa` 0.10's
-`RequestedFormatType::Closest` looks the frame rate up under the *requested*
-resolution — if that resolution does not exist exactly, the lookup fails and the
-library takes the first format in the list (sometimes 160x120@25). That is also
-why `--name`/`--id` exist: numeric indices shift when a USB camera or an iPhone
-via Continuity Camera appears or disappears.
+If `capture` is far above `1000/camera_fps`, the camera itself is limited (low
+light often drops webcams to 15 fps). If `decode` dominates, the build is not
+optimized.
 
 ## Troubleshooting
 
-**The image is black.** Camera permission was denied. Run `viewcam --probe` to
-confirm: it warns when frames are nearly black. Allow the app that runs the
-binary in System Settings → Privacy & Security → Camera and start the binary
-again.
+**The image is black.** Camera permission was denied. Run `viewcam --probe`, it
+warns when frames are almost black. Allow the application that launches the
+binary in System Settings → Privacy & Security → Camera, then start it again.
 
 **"could not open camera … Already in use".** Another program holds the camera
 (Zoom, a browser, OBS). Close it.
 
-**Low fps.** Run `viewcam --stats` to see the cost of each stage. If capture
-itself is slow (say ~66 ms/frame), the camera or the lighting is the limit —
-many webcams drop to 15 fps in low light. If `decode` dominates, the build is
-unoptimized: `Cargo.toml` already optimizes dependencies in the dev profile, so
-`cargo run` reaches ~31 fps, and `cargo run --release` is still ~40% faster at
-decoding (5 ms versus 9 ms per 720p frame).
+**Low frame rate.** Run `viewcam --stats` to see where the time goes. If capture
+already takes ~66 ms per frame, the camera or the lighting is the limit. If
+`decode` dominates, you are on an unoptimized build: `cargo run --release` is
+~40% faster in that stage (5 ms vs 9 ms per 720p frame).
 
-**Fullscreen.** The current `minifb` (0.29) does not expose fullscreen; maximize
-the window with the macOS green button.
+**Full screen.** `minifb` 0.29 does not expose full screen; use the green macOS
+window button.
 
 ## Layout
 
 ```text
-src/main.rs   CLI, format selection, capture loop and drawing
+src/main.rs   CLI, menu bar, format selection, capture loop and drawing
 ```
 
-Tests for the image helpers and the format selection:
+Image helpers and format selection are covered by tests:
 
 ```sh
 cargo test
