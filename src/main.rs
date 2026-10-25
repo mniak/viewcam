@@ -6,6 +6,10 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -15,11 +19,19 @@ use nokhwa::query;
 use nokhwa::utils::{
     ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType,
 };
-use nokhwa::Camera;
+use nokhwa::{Buffer, Camera, NokhwaError};
 
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
 const DEFAULT_FPS: u32 = 30;
+
+/// How long a frame may take to arrive before the camera counts as gone. The
+/// camera delivers at 15-30 fps, so three seconds of silence is a real stall.
+const STALL_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long to wait for a frame before the GUI gets a chance to run again.
+const RECV_WAIT: Duration = Duration::from_millis(200);
+/// Retry interval while no camera is available.
+const RECOVER_INTERVAL: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
 // Command line
@@ -156,6 +168,11 @@ MENU BAR:
     View → Mirror       Turn the mirror effect on or off
     View → Camera       Switch to another camera while running
     View → Freeze / Save snapshot / Quit
+
+RECOVERY:
+    If the current camera stops delivering frames (unplugged, driver stalled),
+    the program goes back to the camera it came from, or to any other camera
+    it finds, and keeps retrying every 2 s until one works again.
 "
     );
 }
@@ -698,6 +715,98 @@ fn bench_gui(args: &Args) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Capture thread
+// ---------------------------------------------------------------------------
+
+/// A worker that owns the camera and pushes frames to the GUI thread.
+///
+/// `nokhwa`'s `frame()` blocks on a channel that AVFoundation only feeds while
+/// the device is alive; when the camera is unplugged the call never returns and
+/// would freeze the whole program. Running it on its own thread keeps the GUI
+/// responsive, so a dead camera can be noticed and replaced.
+struct Feed {
+    frames: Receiver<Result<Buffer, NokhwaError>>,
+    stop: Arc<AtomicBool>,
+    exited: Receiver<()>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Feed {
+    fn spawn(mut camera: Camera) -> Self {
+        // Capacity 1: a paused GUI cannot let frames pile up in memory.
+        let (sender, frames) = sync_channel::<Result<Buffer, NokhwaError>>(1);
+        let (exited_sender, exited) = sync_channel::<()>(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+
+        let handle = std::thread::spawn(move || {
+            loop {
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                let captured = camera.frame();
+                let failed = captured.is_err();
+                if sender.send(captured).is_err() {
+                    // The GUI moved on (or quit); nothing left to feed.
+                    break;
+                }
+                if failed {
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+            }
+            let _ = camera.stop_stream();
+            let _ = exited_sender.send(());
+        });
+
+        Self {
+            frames,
+            stop,
+            exited,
+            handle: Some(handle),
+        }
+    }
+
+    /// Ask the worker to finish, giving up on it if the camera call never
+    /// returns (an unplugged device keeps the worker blocked forever).
+    fn shutdown(self) {
+        let Self {
+            frames,
+            stop,
+            exited,
+            handle,
+        } = self;
+        stop.store(true, Ordering::Relaxed);
+        // Closing the channel wakes a worker that is blocked handing over a
+        // frame; a worker stuck in the backend stays blocked and is detached.
+        drop(frames);
+        if exited.recv_timeout(Duration::from_millis(500)).is_ok() {
+            if let Some(handle) = handle {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    /// Newest frame, discarding any backlog.
+    fn next_frame(&self) -> std::result::Result<Result<Buffer, NokhwaError>, RecvTimeoutError> {
+        let mut newest = self.frames.recv_timeout(RECV_WAIT)?;
+        while let Ok(frame) = self.frames.try_recv() {
+            newest = frame;
+        }
+        Ok(newest)
+    }
+}
+
+/// Open `target` and start feeding it on a worker thread.
+fn open_and_spawn(target: &CameraIndex, args: &Args) -> Result<(Feed, usize, usize)> {
+    let camera = open_camera(target, args)?;
+    let format = camera.camera_format();
+    let width = format.width() as usize;
+    let height = format.height() as usize;
+    println!("Camera {target} open — {}", describe(&camera));
+    Ok((Feed::spawn(camera), width, height))
+}
+
+// ---------------------------------------------------------------------------
 // Menu
 // ---------------------------------------------------------------------------
 
@@ -775,13 +884,14 @@ fn install_menu(
     }
 }
 
-/// Open another camera, keeping the current one if the new device fails.
+/// Open another camera, keeping the current feed alive if the new device fails.
 fn switch_camera(
     position: usize,
     entries: &[CameraEntry],
     selected: &mut usize,
     args: &Args,
-    camera: &mut Camera,
+    feed: &mut Option<Feed>,
+    previous: &mut Option<String>,
 ) -> Option<(usize, usize)> {
     let entry = entries.get(position)?;
     if position == *selected {
@@ -789,27 +899,62 @@ fn switch_camera(
     }
 
     let target = CameraIndex::String(entry.id.clone());
-    match open_camera(&target, args) {
-        Ok(new_camera) => {
-            *camera = new_camera;
+    match open_and_spawn(&target, args) {
+        Ok((new_feed, width, height)) => {
+            *previous = entries.get(*selected).map(|old| old.id.clone());
+            if let Some(old) = feed.take() {
+                old.shutdown();
+            }
+            *feed = Some(new_feed);
             *selected = position;
-
-            let format = camera.camera_format();
-            println!(
-                "Camera now: {} — {}x{} @{} fps ({})",
-                entry.name,
-                format.width(),
-                format.height(),
-                format.frame_rate(),
-                format.format()
-            );
-            Some((format.width() as usize, format.height() as usize))
+            println!("Camera now: {}", entry.name);
+            Some((width, height))
         }
         Err(err) => {
             eprintln!("could not switch to {}: {err:#}", entry.name);
             None
         }
     }
+}
+
+/// The camera disappeared (unplugged, or the driver stopped delivering). Look
+/// at the devices again and try the camera we came from before any other.
+fn recover_camera(
+    entries: &mut Vec<CameraEntry>,
+    selected: &mut usize,
+    previous: &mut Option<String>,
+    args: &Args,
+    quiet: bool,
+) -> Option<(Feed, usize, usize)> {
+    *entries = camera_entries();
+
+    let mut order: Vec<String> = previous.iter().cloned().collect();
+    for entry in entries.iter() {
+        if !order.contains(&entry.id) {
+            order.push(entry.id.clone());
+        }
+    }
+
+    for id in order {
+        let Some(position) = entries.iter().position(|entry| entry.id == id) else {
+            continue;
+        };
+        let target = CameraIndex::String(id);
+        match open_and_spawn(&target, args) {
+            Ok((feed, width, height)) => {
+                println!("Back on {}", entries[position].name);
+                *selected = position;
+                return Some((feed, width, height));
+            }
+            Err(err) => {
+                if !quiet {
+                    eprintln!("could not reopen {}: {err:#}", entries[position].name);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -826,7 +971,7 @@ fn main() -> Result<()> {
         return bench_gui(&args);
     }
 
-    let entries = camera_entries();
+    let mut entries = camera_entries();
     let mut selected = resolve_selection(&args, &entries)?;
     let target = CameraIndex::String(entries[selected].id.clone());
 
@@ -837,12 +982,8 @@ fn main() -> Result<()> {
         return probe_camera(&target, &args);
     }
 
-    let mut camera = open_camera(&target, &args)?;
-    let format = camera.camera_format();
-    let mut width = format.width() as usize;
-    let mut height = format.height() as usize;
+    let (feed, mut width, mut height) = open_and_spawn(&target, &args)?;
 
-    println!("Camera {target} open — {}", describe(&camera));
     if width as u32 != args.width || height as u32 != args.height {
         println!(
             "note: requested {}x{}, the camera gave {}x{}",
@@ -868,6 +1009,13 @@ fn main() -> Result<()> {
     let run_started = Instant::now();
     let mut title_at = Instant::now();
     let mut menu_handle: Option<MenuHandle> = None;
+
+    let mut feed = Some(feed);
+    // Camera we switched away from: the first candidate if the current one dies.
+    let mut previous: Option<String> = None;
+    let mut last_frame_at = Instant::now();
+    let mut next_attempt_at = Instant::now();
+    let mut first_attempt = true;
 
     install_menu(
         &mut window,
@@ -906,7 +1054,8 @@ fn main() -> Result<()> {
                         &entries,
                         &mut selected,
                         &args,
-                        &mut camera,
+                        &mut feed,
+                        &mut previous,
                     ) {
                         width = new_width;
                         height = new_height;
@@ -915,6 +1064,7 @@ fn main() -> Result<()> {
                         have_frame = false;
                         redraw = true;
                         menu_changed = true;
+                        last_frame_at = Instant::now();
                     }
                 }
                 _ => {}
@@ -936,51 +1086,110 @@ fn main() -> Result<()> {
             println!("{}", if frozen { "Frozen" } else { "Live" });
         }
 
+        let mut lost = false;
+
         if !frozen {
-            let t = Instant::now();
-            let captured = camera.frame();
-            stage.capture = t.elapsed();
+            if let Some(current) = feed.as_ref() {
+                // Waiting for the worker doubles as the frame pacing; a camera
+                // that stops delivering only costs this wait, never the thread.
+                let t = Instant::now();
+                let received = current.next_frame();
+                stage.capture = t.elapsed();
 
-            match captured {
-                Ok(frame) => {
-                    let t = Instant::now();
-                    let decoded = frame.decode_image::<RgbFormat>();
-                    stage.decode = t.elapsed();
+                match received {
+                    Ok(Ok(frame)) => {
+                        last_frame_at = Instant::now();
+                        let t = Instant::now();
+                        let decoded = frame.decode_image::<RgbFormat>();
+                        stage.decode = t.elapsed();
 
-                    match decoded {
-                        Ok(decoded) => {
-                            consecutive_errors = 0;
-                            let (w, h) = (decoded.width() as usize, decoded.height() as usize);
+                        match decoded {
+                            Ok(decoded) => {
+                                consecutive_errors = 0;
+                                let (w, h) = (decoded.width() as usize, decoded.height() as usize);
 
-                            if (w, h) != (width, height) {
-                                width = w;
-                                height = h;
-                                pixels = vec![0; width * height];
+                                if (w, h) != (width, height) {
+                                    width = w;
+                                    height = h;
+                                    pixels = vec![0; width * height];
+                                }
+
+                                let t = Instant::now();
+                                frame_rgb = decoded.into_raw();
+                                blit_rgb_to_pixels(&frame_rgb, &mut pixels, width, mirror);
+                                stage.convert = t.elapsed();
+
+                                have_frame = true;
+                                redraw = true;
                             }
-
-                            let t = Instant::now();
-                            frame_rgb = decoded.into_raw();
-                            blit_rgb_to_pixels(&frame_rgb, &mut pixels, width, mirror);
-                            stage.convert = t.elapsed();
-
-                            have_frame = true;
-                            redraw = true;
-                        }
-                        Err(err) => {
-                            consecutive_errors += 1;
-                            eprintln!("decode error: {err}");
+                            Err(err) => {
+                                consecutive_errors += 1;
+                                eprintln!("decode error: {err}");
+                            }
                         }
                     }
-                }
-                Err(err) => {
-                    consecutive_errors += 1;
-                    eprintln!("capture error: {err}");
-                    std::thread::sleep(Duration::from_millis(30));
+                    Ok(Err(err)) => {
+                        consecutive_errors += 1;
+                        eprintln!("capture error: {err}");
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        if last_frame_at.elapsed() >= STALL_TIMEOUT {
+                            lost = true;
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => lost = true,
                 }
             }
 
-            if consecutive_errors > 100 {
-                bail!("camera stopped delivering frames ({consecutive_errors} failures in a row)");
+            if consecutive_errors >= 60 {
+                lost = true;
+            }
+        }
+
+        if lost {
+            let name = entries
+                .get(selected)
+                .map(|entry| entry.name.clone())
+                .unwrap_or_else(|| "camera".to_string());
+            eprintln!("camera lost: {name}");
+            if let Some(dead) = feed.take() {
+                dead.shutdown();
+            }
+            // Forget which entry is live; the menu should not claim one is.
+            selected = usize::MAX;
+            consecutive_errors = 0;
+            first_attempt = true;
+            next_attempt_at = Instant::now();
+        }
+
+        // (Re)connect: either a camera just died or we are still waiting for one.
+        if !frozen && feed.is_none() && Instant::now() >= next_attempt_at {
+            let quiet = !first_attempt;
+            match recover_camera(&mut entries, &mut selected, &mut previous, &args, quiet) {
+                Some((new_feed, new_width, new_height)) => {
+                    feed = Some(new_feed);
+                    width = new_width;
+                    height = new_height;
+                    pixels = vec![0; width * height];
+                    frame_rgb.clear();
+                    have_frame = false;
+                    redraw = true;
+                    menu_changed = true;
+                    last_frame_at = Instant::now();
+                    consecutive_errors = 0;
+                }
+                None => {
+                    if first_attempt {
+                        eprintln!(
+                            "no camera available; retrying every {} s",
+                            RECOVER_INTERVAL.as_secs()
+                        );
+                    }
+                    first_attempt = false;
+                    next_attempt_at = Instant::now() + RECOVER_INTERVAL;
+                    // The device list changed even though nothing reopened.
+                    menu_changed = true;
+                }
             }
         }
 
@@ -1033,20 +1242,6 @@ fn main() -> Result<()> {
 
             // The title bar is a macOS window property: updating it at camera
             // rate makes the window server redraw it 30 times a second.
-            if title_at.elapsed() >= Duration::from_millis(500) {
-                title_at = Instant::now();
-                window.set_title(&format!(
-                    "viewcam — {width}x{height} — {measured_fps:.0} fps — {}",
-                    if frozen {
-                        "frozen"
-                    } else if mirror {
-                        "mirrored"
-                    } else {
-                        "live"
-                    }
-                ));
-            }
-
             if args.stats {
                 stats.record(stage);
                 stats.report_if_due();
@@ -1072,9 +1267,28 @@ fn main() -> Result<()> {
                 }
             }
         } else {
-            // No new frame (frozen or waiting): keep window events flowing.
+            // No new frame (frozen, no camera or waiting): keep events flowing.
             window.update();
-            std::thread::sleep(Duration::from_millis(5));
+            let pause = if feed.is_none() { 50 } else { 5 };
+            std::thread::sleep(Duration::from_millis(pause));
+        }
+
+        // Outside the frame branch: the state must reach the title bar even
+        // when the image is frozen or no camera is available.
+        if title_at.elapsed() >= Duration::from_millis(500) {
+            title_at = Instant::now();
+            window.set_title(&format!(
+                "viewcam — {width}x{height} — {measured_fps:.0} fps — {}",
+                if feed.is_none() {
+                    "no camera"
+                } else if frozen {
+                    "frozen"
+                } else if mirror {
+                    "mirrored"
+                } else {
+                    "live"
+                }
+            ));
         }
     }
 

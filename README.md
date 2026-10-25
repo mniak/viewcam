@@ -83,8 +83,27 @@ the video window if your terminal still owns the menu bar).
 | `Space`      | Freeze / resume the image |
 
 The window title shows resolution, measured fps and the current state (`live`,
-`mirrored`, `frozen`). The window can be resized; the image keeps its aspect
-ratio.
+`mirrored`, `frozen`, `no camera`). The window can be resized; the image keeps
+its aspect ratio.
+
+## What happens when a camera disappears
+
+If the current camera stops delivering frames — unplugged USB camera, an iPhone
+leaving Continuity, a driver that stopped answering — the program notices within
+about three seconds and:
+
+1. drops the dead camera;
+2. looks at the devices again;
+3. reopens the camera you came from, or any other camera it finds;
+4. retries every two seconds while none is available, then reconnects on its
+   own when a camera is plugged back in.
+
+The window keeps repainting the last frame the whole time, so the program never
+freezes. The menu's `Camera` list is refreshed after each change.
+
+This works because capture runs on its own thread. `nokhwa`'s `frame()` blocks on
+a channel that AVFoundation only feeds while the device is alive: after an unplug
+the call never returns, which would hang a loop that called it directly.
 
 ## How the capture format is chosen
 
@@ -141,6 +160,10 @@ binary in System Settings → Privacy & Security → Camera, then start it again
 **"could not open camera … Already in use".** Another program holds the camera
 (Zoom, a browser, OBS). Close it.
 
+**The camera was unplugged.** Nothing to do: the program returns to the previous
+camera (or any other it finds) and keeps retrying. If the window says `no
+camera`, plug one back in and it reconnects by itself.
+
 **Low frame rate.** Run `viewcam --stats` to see where the time goes. If capture
 already takes ~66 ms per frame, the camera or the lighting is the limit. If
 `decode` dominates, you are on an unoptimized build: `cargo run --release` is
@@ -152,7 +175,7 @@ window button.
 ## Layout
 
 ```text
-src/main.rs   CLI, menu bar, format selection, capture loop and drawing
+src/main.rs   CLI, menu bar, capture thread, format selection, loop and drawing
 ```
 
 Image helpers and format selection are covered by tests:
