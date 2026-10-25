@@ -75,6 +75,13 @@ The current camera is marked with `•` in the `Camera` submenu. The menu bar
 belongs to the app, so it shows up when viewcam is the active application (click
 the video window if your terminal still owns the menu bar).
 
+Picking a camera opens it in the background: the current image keeps playing
+while the new device is being prepared, so the window never stalls. The title
+bar shows `opening <name>`, then the live state once frames arrive. If the device
+is slow or busy the open is retried a few times before it gives up, and the
+current camera stays on screen; a failed switch is reported as
+`<name> unavailable` in the title bar for a few seconds.
+
 | Key          | Effect                    |
 | ------------ | ------------------------- |
 | `Esc` / `Q`  | Quit                      |
@@ -83,8 +90,8 @@ the video window if your terminal still owns the menu bar).
 | `Space`      | Freeze / resume the image |
 
 The window title shows resolution, measured fps and the current state (`live`,
-`mirrored`, `frozen`, `no camera`). The window can be resized; the image keeps
-its aspect ratio.
+`mirrored`, `frozen`, `waiting for frames`, `no signal`, `no camera`,
+`opening …`). The window can be resized; the image keeps its aspect ratio.
 
 ## What happens when a camera disappears
 
@@ -167,6 +174,12 @@ camera`, plug one back in and it reconnects by itself.
 
 **A camera connected while the program runs.** It appears in the `View → Camera`
 menu within about a second; pick it there.
+
+**Switching to a camera does nothing.** The title bar says `<name> unavailable`
+when the device refused to open (in use, just disconnected, or a flaky driver).
+The current camera keeps playing; try again once the other program releases it.
+`waiting for frames` means the camera opened but delivered no picture yet, and
+the program falls back to the previous one if it stays silent.
 
 **`--probe` gives up after ten seconds.** That camera delivered no frame at all.
 It is probably held by another program, or the permission was denied; the usual

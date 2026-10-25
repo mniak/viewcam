@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -39,11 +39,19 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 /// After a device vanishes from the list, how long its stream may still be
 /// silent before the camera counts as gone.
 const REMOVAL_GRACE: Duration = Duration::from_millis(250);
+/// Opening a camera can take a while, and a busy device may fail on the first
+/// try. The open runs in the background and gets a few attempts.
+const OPEN_ATTEMPTS: u32 = 3;
+/// Give up on a background open after this long (the thread is left to finish).
+const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a status note stays in the window title.
+const NOTICE_TIME: Duration = Duration::from_secs(4);
 
 // ---------------------------------------------------------------------------
 // Command line
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct Args {
     index: Option<u32>,
     name: Option<String>,
@@ -878,6 +886,65 @@ fn open_and_spawn(target: &CameraIndex, args: &Args) -> Result<(Feed, usize, usi
     Ok((Feed::spawn(camera), width, height))
 }
 
+/// A camera being opened off the GUI thread, so the current image keeps
+/// playing and the window stays responsive while the driver works.
+struct PendingOpen {
+    label: String,
+    target_id: String,
+    /// Camera that was live when the switch was requested: the fallback if the
+    /// new one turns out to be dead.
+    previous_id: Option<String>,
+    result: Receiver<Result<(Feed, usize, usize), anyhow::Error>>,
+    started_at: Instant,
+}
+
+/// Start opening `target` in the background. A device that is still busy (a
+/// session being torn down, a just-unplugged driver) often succeeds a moment
+/// later, so the open is retried a few times before giving up.
+fn begin_open(
+    label: String,
+    target_id: String,
+    args: Args,
+    previous_id: Option<String>,
+) -> PendingOpen {
+    let (sender, result) = sync_channel(1);
+    let thread_label = label.clone();
+    let thread_target = CameraIndex::String(target_id.clone());
+
+    std::thread::spawn(move || {
+        let mut last_error = None;
+        for attempt in 1..=OPEN_ATTEMPTS {
+            match open_and_spawn(&thread_target, &args) {
+                Ok(opened) => {
+                    // If the GUI moved on, this fails and the camera is closed.
+                    let _ = sender.send(Ok(opened));
+                    return;
+                }
+                Err(err) => {
+                    last_error = Some(err);
+                    if attempt < OPEN_ATTEMPTS {
+                        eprintln!(
+                            "could not open {thread_label} (attempt {attempt}/{OPEN_ATTEMPTS}), retrying"
+                        );
+                        std::thread::sleep(Duration::from_millis(400 * u64::from(attempt)));
+                    }
+                }
+            }
+        }
+        let _ = sender.send(Err(
+            last_error.unwrap_or_else(|| anyhow!("the camera did not open"))
+        ));
+    });
+
+    PendingOpen {
+        label,
+        target_id,
+        previous_id,
+        result,
+        started_at: Instant::now(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Menu
 // ---------------------------------------------------------------------------
@@ -953,39 +1020,6 @@ fn install_menu(
     match build_menu(entries, selected, mirror, frozen) {
         Ok(menu) => *handle = Some(window.add_menu(&menu)),
         Err(err) => eprintln!("could not build the menu: {err:#}"),
-    }
-}
-
-/// Open another camera, keeping the current feed alive if the new device fails.
-fn switch_camera(
-    position: usize,
-    entries: &[CameraEntry],
-    selected: &mut usize,
-    args: &Args,
-    feed: &mut Option<Feed>,
-    previous: &mut Option<String>,
-) -> Option<(usize, usize)> {
-    let entry = entries.get(position)?;
-    if position == *selected {
-        return None;
-    }
-
-    let target = CameraIndex::String(entry.id.clone());
-    match open_and_spawn(&target, args) {
-        Ok((new_feed, width, height)) => {
-            *previous = entries.get(*selected).map(|old| old.id.clone());
-            if let Some(old) = feed.take() {
-                old.shutdown();
-            }
-            *feed = Some(new_feed);
-            *selected = position;
-            println!("Camera now: {}", entry.name);
-            Some((width, height))
-        }
-        Err(err) => {
-            eprintln!("could not switch to {}: {err:#}", entry.name);
-            None
-        }
     }
 }
 
@@ -1093,6 +1127,9 @@ fn main() -> Result<()> {
     let mut pending_entries: Option<Vec<CameraEntry>> = None;
     let mut next_attempt_at = Instant::now();
     let mut first_attempt = true;
+    // Camera being opened in the background, and the last status note.
+    let mut pending_open: Option<PendingOpen> = None;
+    let mut notice: Option<(String, Instant)> = None;
 
     install_menu(
         &mut window,
@@ -1110,6 +1147,54 @@ fn main() -> Result<()> {
         let mut mirror_changed = false;
         let mut snapshot_requested = false;
 
+        // Finish a background camera open. The old feed keeps running until the
+        // new camera is really there, so a failed switch costs no image.
+        if let Some(open) = pending_open.take() {
+            match open.result.try_recv() {
+                Ok(Ok((new_feed, _, _))) => {
+                    if let Some(old) = feed.take() {
+                        // Release the old device without stalling the GUI.
+                        std::thread::spawn(move || old.shutdown());
+                    }
+                    feed = Some(new_feed);
+                    // The window keeps the current picture until the first new
+                    // frame arrives; the capture loop adopts the new size then.
+                    selected = entries
+                        .iter()
+                        .position(|entry| entry.id == open.target_id)
+                        .unwrap_or(usize::MAX);
+                    previous = open.previous_id;
+                    last_frame_at = Instant::now();
+                    frames_from_feed = 0;
+                    consecutive_errors = 0;
+                    redraw = true;
+                    menu_changed = true;
+                    notice = None;
+                    println!("Camera now: {}", open.label);
+                }
+                Ok(Err(err)) => {
+                    eprintln!("could not switch to {}: {err:#}", open.label);
+                    notice = Some((format!("{} unavailable", open.label), Instant::now()));
+                }
+                Err(TryRecvError::Empty) => {
+                    if open.started_at.elapsed() < OPEN_TIMEOUT {
+                        pending_open = Some(open);
+                    } else {
+                        eprintln!(
+                            "gave up opening {} after {} s",
+                            open.label,
+                            OPEN_TIMEOUT.as_secs()
+                        );
+                        notice = Some((format!("{} unavailable", open.label), Instant::now()));
+                    }
+                }
+                Err(TryRecvError::Disconnected) => {
+                    eprintln!("the camera open thread stopped unexpectedly");
+                    notice = Some((format!("{} unavailable", open.label), Instant::now()));
+                }
+            }
+        }
+
         // Menu bar: one click per event.
         while let Some(id) = window.is_menu_pressed() {
             match id {
@@ -1126,23 +1211,24 @@ fn main() -> Result<()> {
                 MENU_SNAPSHOT => snapshot_requested = true,
                 MENU_QUIT => return Ok(()),
                 id if id >= MENU_CAMERA_BASE => {
-                    if let Some((new_width, new_height)) = switch_camera(
-                        id - MENU_CAMERA_BASE,
-                        &entries,
-                        &mut selected,
-                        &args,
-                        &mut feed,
-                        &mut previous,
-                    ) {
-                        width = new_width;
-                        height = new_height;
-                        pixels = vec![0; width * height];
-                        frame_rgb.clear();
-                        have_frame = false;
-                        redraw = true;
-                        menu_changed = true;
-                        last_frame_at = Instant::now();
-                        frames_from_feed = 0;
+                    let position = id - MENU_CAMERA_BASE;
+                    if let Some(entry) = entries.get(position) {
+                        // Do not open a camera twice, and do not restart an open
+                        // for the camera that is already on its way.
+                        let already_opening = pending_open
+                            .as_ref()
+                            .is_some_and(|open| open.target_id == entry.id);
+                        if position != selected && !already_opening {
+                            let previous_id =
+                                entries.get(selected).map(|current| current.id.clone());
+                            pending_open = Some(begin_open(
+                                entry.name.clone(),
+                                entry.id.clone(),
+                                args.clone(),
+                                previous_id,
+                            ));
+                            notice = None;
+                        }
                     }
                 }
                 _ => {}
@@ -1308,6 +1394,7 @@ fn main() -> Result<()> {
                     have_frame = false;
                     redraw = true;
                     menu_changed = true;
+                    notice = None;
                     last_frame_at = Instant::now();
                     frames_from_feed = 0;
                     consecutive_errors = 0;
@@ -1415,19 +1502,35 @@ fn main() -> Result<()> {
 
         // Outside the frame branch: the state must reach the title bar even
         // when the image is frozen or no camera is available.
-        if title_at.elapsed() >= Duration::from_millis(500) {
+        if title_at.elapsed() >= Duration::from_millis(400) {
             title_at = Instant::now();
-            window.set_title(&format!(
-                "viewcam — {width}x{height} — {measured_fps:.0} fps — {}",
-                if feed.is_none() {
-                    "no camera"
-                } else if frozen {
-                    "frozen"
-                } else if mirror {
-                    "mirrored"
+            let live_state = if feed.is_none() {
+                "no camera"
+            } else if frozen {
+                "frozen"
+            } else if frames_from_feed == 0 && last_frame_at.elapsed() > Duration::from_millis(500)
+            {
+                "waiting for frames"
+            } else if last_frame_at.elapsed() > Duration::from_millis(600) {
+                "no signal"
+            } else if mirror {
+                "mirrored"
+            } else {
+                "live"
+            };
+            let state = if let Some(open) = &pending_open {
+                format!("opening {}", open.label)
+            } else if let Some((text, at)) = &notice {
+                if at.elapsed() < NOTICE_TIME {
+                    text.clone()
                 } else {
-                    "live"
+                    live_state.to_string()
                 }
+            } else {
+                live_state.to_string()
+            };
+            window.set_title(&format!(
+                "viewcam — {width}x{height} — {measured_fps:.0} fps — {state}"
             ));
         }
     }
