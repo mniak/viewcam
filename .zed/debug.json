@@ -1,0 +1,15 @@
+[
+  {
+    "label": "Debug viewcam (CodeLLDB)",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "build": {
+      "command": "cargo",
+      "args": ["build"]
+    },
+    "program": "$ZED_WORKTREE_ROOT/target/debug/viewcam",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    // CodeLLDB requires "sourceLanguages" to map Rust sources
+    "sourceLanguages": ["rust"]
+  }
+]
