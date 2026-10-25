@@ -1,0 +1,18 @@
+[package]
+name = "viewcam"
+version = "0.1.0"
+edition = "2021"
+description = "Real-time webcam viewer for the terminal (native capture + lightweight window)"
+
+[dependencies]
+anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+minifb = "0.29"
+nokhwa = { version = "0.10.11", features = ["input-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nokhwa-bindings-macos = "0.2.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
