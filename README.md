@@ -36,16 +36,21 @@ viewcam [OPTIONS] [INDEX]
     --probe         Capture ~20 frames, print stats and a PNG, then exit
     --bench         Run a synthetic test pattern for 5 s and report GUI speed
     --stats         Print per-stage timings every second while running
--i, --index <N>     Camera to open (default: 0)
+-i, --index <N>     Camera to open (default: the last one used, else 0)
 -n, --name <TEXT>   Open the first camera whose name contains TEXT
     --id <ID>       Open a camera by its system id (see --list)
 -W, --width <N>     Preferred capture width (default: 1280)
 -H, --height <N>    Preferred capture height (default: 720)
     --fps <N>       Preferred frame rate (default: 30)
--m, --mirror        Start mirrored, like a mirror (default)
-    --no-mirror     Start unmirrored
+-m, --mirror        Start mirrored and remember it (default)
+    --no-mirror     Start unmirrored and remember it
+    --no-save       Do not write the camera and mirror choices to disk
+    --forget        Delete the saved preferences and exit
 -h, --help          Show this help
 ```
+
+The camera and the mirror state are remembered between runs; see
+[Preferences](#preferences).
 
 Examples:
 
@@ -82,6 +87,9 @@ is slow or busy the open is retried a few times before it gives up, and the
 current camera stays on screen; a failed switch is reported as
 `<name> unavailable` in the title bar for a few seconds.
 
+The camera you pick here and the mirror state are saved, so the next run starts
+the same way.
+
 | Key          | Effect                    |
 | ------------ | ------------------------- |
 | `Esc` / `Q`  | Quit                      |
@@ -107,11 +115,43 @@ answering — the program notices within about half a second and:
 
 Cameras connected while the program is running show up in the `Camera` menu
 within about a second; nothing needs to be restarted. The window keeps repainting
-the last frame the whole time, so the program never freezes.
+the last frame the whole time, so the program never freezes. None of this
+changes the [saved preference](#preferences): the camera you picked is used again
+once it is connected.
 
 This works because capture runs on its own thread. `nokhwa`'s `frame()` blocks on
 a channel that AVFoundation only feeds while the device is alive: after an unplug
 the call never returns, which would hang a loop that called it directly.
+
+## Preferences
+
+The camera and the mirror state chosen **on purpose** are remembered, whether
+they came from the command line (`--index`, `--name`, `--id`, `--mirror`,
+`--no-mirror`) or from the menu. The next run opens the same way.
+
+- File: `~/Library/Application Support/viewcam/config` on macOS
+  (`$XDG_CONFIG_HOME/viewcam/config` elsewhere). Set `VIEWCAM_CONFIG=<path>` to
+  use another file, for example to keep separate profiles.
+- Content: a few `key=value` lines (camera id, camera name, mirror). It is plain
+  text; editing or deleting it is safe. The camera is stored by system id, not by
+  position, so a camera appearing or disappearing does not point the file at the
+  wrong device.
+- Precedence: an explicit command-line option wins over the saved value, which
+  wins over the built-in default (first camera, mirrored).
+
+Only explicit choices are written. A camera is stored once it actually delivers a
+frame, so a device that opens but stays dark is not remembered. If the current
+camera disappears, the fallback to another device is *not* saved: the file keeps
+the camera you picked, so replugging (or freeing) that device brings it back on
+the next run. If the saved camera is not connected, viewcam prints a note and
+opens the first available one; if it is connected but refuses to open (held by
+another program), viewcam warns and tries the others instead of failing to
+start.
+
+```sh
+viewcam --no-save        # one-off run: read the preferences, do not write them
+viewcam --forget         # delete the saved preferences and exit
+```
 
 ## How the capture format is chosen
 
@@ -180,6 +220,11 @@ when the device refused to open (in use, just disconnected, or a flaky driver).
 The current camera keeps playing; try again once the other program releases it.
 `waiting for frames` means the camera opened but delivered no picture yet, and
 the program falls back to the previous one if it stays silent.
+
+**It opens a camera you did not expect.** The camera picked last time (from the
+menu or the command line) is remembered. Pick another one, or run
+`viewcam --forget` to go back to the built-in default (first camera, mirrored).
+`viewcam --no-save` opens without changing what is stored.
 
 **`--probe` gives up after ten seconds.** That camera delivered no frame at all.
 It is probably held by another program, or the permission was denied; the usual

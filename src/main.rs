@@ -5,7 +5,8 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::Arc;
@@ -59,7 +60,13 @@ struct Args {
     list: bool,
     probe: bool,
     formats: bool,
-    mirror: bool,
+    /// `Some` only when the user asked for a mirror state on the command line:
+    /// otherwise the saved preference decides.
+    mirror: Option<bool>,
+    /// Read the saved preferences but never write them.
+    no_save: bool,
+    /// Delete the saved preferences and exit.
+    forget: bool,
     stats: bool,
     bench: bool,
     width: u32,
@@ -76,7 +83,9 @@ impl Default for Args {
             list: false,
             probe: false,
             formats: false,
-            mirror: true,
+            mirror: None,
+            no_save: false,
+            forget: false,
             stats: false,
             bench: false,
             width: DEFAULT_WIDTH,
@@ -98,8 +107,10 @@ impl Args {
                 "--formats" => args.formats = true,
                 "--stats" => args.stats = true,
                 "--bench" => args.bench = true,
-                "-m" | "--mirror" => args.mirror = true,
-                "--no-mirror" => args.mirror = false,
+                "-m" | "--mirror" => args.mirror = Some(true),
+                "--no-mirror" => args.mirror = Some(false),
+                "--no-save" => args.no_save = true,
+                "--forget" => args.forget = true,
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -147,6 +158,11 @@ impl Args {
 
         Ok(args)
     }
+
+    /// True when the command line itself picked a camera.
+    fn chose_camera(&self) -> bool {
+        self.id.is_some() || self.name.is_some() || self.index.is_some()
+    }
 }
 
 fn print_usage() {
@@ -163,14 +179,16 @@ OPTIONS:
         --probe         Capture ~20 frames, print stats and a PNG, then exit
         --bench         Run a synthetic test pattern for 5 s and report GUI speed
         --stats         Print per-stage timings every second while running
-    -i, --index <N>     Camera to open (default: 0)
+    -i, --index <N>     Camera to open (default: the last one used, else 0)
     -n, --name <TEXT>   Open the first camera whose name contains TEXT
         --id <ID>       Open a camera by its system id (see --list)
     -W, --width <N>     Preferred capture width (default: {DEFAULT_WIDTH})
     -H, --height <N>    Preferred capture height (default: {DEFAULT_HEIGHT})
         --fps <N>       Preferred frame rate (default: {DEFAULT_FPS})
-    -m, --mirror        Start mirrored, like a mirror (default)
-        --no-mirror     Start unmirrored
+    -m, --mirror        Start mirrored and remember it (default)
+        --no-mirror     Start unmirrored and remember it
+        --no-save       Do not write the camera and mirror choices to disk
+        --forget        Delete the saved preferences and exit
     -h, --help          Show this help
 
 KEYS (while the window has focus):
@@ -183,6 +201,13 @@ MENU BAR:
     View → Mirror       Turn the mirror effect on or off
     View → Camera       Switch to another camera while running
     View → Freeze / Save snapshot / Quit
+
+PREFERENCES:
+    The camera picked here (by --index/--name/--id or from the menu) and the
+    mirror state are remembered in the user config file, so the next run opens
+    the same way. Automatic fallback after a device disappears does not
+    overwrite them; the saved camera is used again once it is back.
+    Set VIEWCAM_CONFIG=<path> to use another file.
 
 RECOVERY:
     The device list is re-read every 500 ms: a camera connected while the
@@ -251,6 +276,205 @@ fn camera_entries() -> Vec<CameraEntry> {
     query_cameras().unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------
+// Preferences
+// ---------------------------------------------------------------------------
+
+/// What the user picked on purpose: a camera (from the command line or from the
+/// menu) and the mirror switch. Automatic fallback never writes here, so a
+/// camera that was unplugged comes back as the saved choice when replugged.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Preferences {
+    /// Stable system id (`CameraIndex::misc`), never a position: indices shift
+    /// when devices appear and disappear.
+    camera_id: Option<String>,
+    /// The name the camera had when it was saved; only used in messages.
+    camera_name: Option<String>,
+    mirror: Option<bool>,
+}
+
+/// File name inside the per-user configuration directory.
+const PREFERENCES_FILE: &str = "config";
+
+impl Preferences {
+    /// `$VIEWCAM_CONFIG` when set, else the usual per-user location:
+    /// `~/Library/Application Support/viewcam/config` on macOS.
+    fn path() -> Option<PathBuf> {
+        if let Some(path) = std::env::var_os("VIEWCAM_CONFIG") {
+            return Some(PathBuf::from(path));
+        }
+
+        let home = PathBuf::from(std::env::var_os("HOME")?);
+        let base = if cfg!(target_os = "macos") {
+            home.join("Library").join("Application Support")
+        } else if let Some(dirs) = std::env::var_os("XDG_CONFIG_HOME") {
+            PathBuf::from(dirs)
+        } else {
+            home.join(".config")
+        };
+        Some(base.join("viewcam").join(PREFERENCES_FILE))
+    }
+
+    /// `key=value` lines. Unknown keys are ignored so an older viewcam can read
+    /// a file written by a newer one.
+    fn parse(text: &str) -> Self {
+        let mut prefs = Self::default();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let value = value.trim();
+            match key.trim() {
+                "mirror" => {
+                    prefs.mirror = match value.to_ascii_lowercase().as_str() {
+                        "on" | "true" | "yes" | "1" => Some(true),
+                        "off" | "false" | "no" | "0" => Some(false),
+                        _ => None,
+                    };
+                }
+                "camera_id" if !value.is_empty() => prefs.camera_id = Some(value.to_string()),
+                "camera_name" if !value.is_empty() => prefs.camera_name = Some(value.to_string()),
+                _ => {}
+            }
+        }
+        prefs
+    }
+
+    fn render(&self) -> String {
+        let mut out = String::from("# viewcam preferences — written by viewcam, safe to delete\n");
+        if let Some(mirror) = self.mirror {
+            out.push_str(if mirror {
+                "mirror=on\n"
+            } else {
+                "mirror=off\n"
+            });
+        }
+        if let Some(id) = &self.camera_id {
+            out.push_str(&format!("camera_id={}\n", one_line(id)));
+        }
+        if let Some(name) = &self.camera_name {
+            out.push_str(&format!("camera_name={}\n", one_line(name)));
+        }
+        out
+    }
+
+    /// A missing or unreadable file just means "no preferences".
+    fn load(path: &Path) -> Self {
+        match fs::read_to_string(path) {
+            Ok(text) => Self::parse(&text),
+            Err(err) if err.kind() == ErrorKind::NotFound => Self::default(),
+            Err(err) => {
+                eprintln!("warning: could not read {}: {err}", path.display());
+                Self::default()
+            }
+        }
+    }
+
+    /// Write through a temporary file so a crash cannot leave a half file.
+    fn save(&self, path: &Path) -> Result<()> {
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)
+                .with_context(|| format!("could not create {}", dir.display()))?;
+        }
+        let temporary = path.with_extension("tmp");
+        fs::write(&temporary, self.render())
+            .with_context(|| format!("could not write {}", temporary.display()))?;
+        fs::rename(&temporary, path)
+            .with_context(|| format!("could not replace {}", path.display()))?;
+        Ok(())
+    }
+}
+
+/// Values inside a line-oriented file must not break the next line.
+fn one_line(value: &str) -> String {
+    value.replace(['\n', '\r'], " ")
+}
+
+/// Preferences plus where they came from, so every explicit change can be
+/// stored right away.
+struct PrefsStore {
+    prefs: Preferences,
+    path: Option<PathBuf>,
+    /// `--no-save` turns writing off without affecting reading.
+    enabled: bool,
+}
+
+impl PrefsStore {
+    fn load(enabled: bool) -> Self {
+        let path = Preferences::path();
+        let prefs = path.as_deref().map(Preferences::load).unwrap_or_default();
+        Self {
+            prefs,
+            path,
+            enabled,
+        }
+    }
+
+    fn saved_mirror(&self) -> Option<bool> {
+        self.prefs.mirror
+    }
+
+    fn saved_camera(&self) -> Option<&str> {
+        self.prefs.camera_id.as_deref()
+    }
+
+    /// Delete the file backing the preferences.
+    fn forget() -> Result<()> {
+        let Some(path) = Preferences::path() else {
+            println!("No preferences file location is available.");
+            return Ok(());
+        };
+        match fs::remove_file(&path) {
+            Ok(()) => println!("Removed {}", path.display()),
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                println!("Nothing saved at {}", path.display());
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("could not remove {}", path.display()));
+            }
+        }
+        Ok(())
+    }
+
+    fn remember_mirror(&mut self, mirror: bool) {
+        if self.prefs.mirror == Some(mirror) {
+            return;
+        }
+        self.prefs.mirror = Some(mirror);
+        self.write();
+    }
+
+    fn remember_camera(&mut self, entry: &CameraEntry) {
+        if self.prefs.camera_id.as_deref() == Some(entry.id.as_str())
+            && self.prefs.camera_name.as_deref() == Some(entry.name.as_str())
+        {
+            return;
+        }
+        self.prefs.camera_id = Some(entry.id.clone());
+        self.prefs.camera_name = Some(entry.name.clone());
+        self.write();
+    }
+
+    fn write(&self) {
+        if !self.enabled {
+            return;
+        }
+        let Some(path) = &self.path else {
+            return;
+        };
+        if let Err(err) = self.prefs.save(path) {
+            eprintln!(
+                "warning: could not save preferences to {}: {err:#}",
+                path.display()
+            );
+        }
+    }
+}
+
 /// Turn `--index` / `--name` / `--id` into a position in `entries`.
 ///
 /// Numeric indices shift when devices appear or disappear (a Continuity iPhone
@@ -305,6 +529,75 @@ fn resolve_selection(args: &Args, entries: &[CameraEntry]) -> Result<usize> {
         );
     }
     Ok(wanted)
+}
+
+/// The camera to open at startup. An explicit command-line choice always wins;
+/// otherwise the saved camera is used when it is connected, and the first
+/// camera when it is not.
+fn resolve_startup(args: &Args, prefs: &PrefsStore, entries: &[CameraEntry]) -> Result<usize> {
+    if args.chose_camera() {
+        return resolve_selection(args, entries);
+    }
+    if entries.is_empty() {
+        return resolve_selection(args, entries);
+    }
+
+    if let Some(saved) = prefs.saved_camera() {
+        if let Some(position) = entries.iter().position(|entry| entry.id == saved) {
+            return Ok(position);
+        }
+        let label = prefs
+            .prefs
+            .camera_name
+            .as_deref()
+            .unwrap_or(saved)
+            .to_string();
+        eprintln!(
+            "note: saved camera {label:?} is not connected; using {}",
+            entries[0].name
+        );
+    }
+
+    Ok(0)
+}
+
+/// Open the camera at `selected`. When the choice came from the saved
+/// preferences and that device fails, another camera is tried instead, so a
+/// busy remembered camera does not stop the program from starting. An explicit
+/// command-line choice is never second-guessed.
+fn open_selected(
+    args: &Args,
+    entries: &[CameraEntry],
+    selected: &mut usize,
+    allow_fallback: bool,
+) -> Result<(Feed, usize, usize)> {
+    let target = CameraIndex::String(entries[*selected].id.clone());
+    match open_and_spawn(&target, args) {
+        Ok(opened) => Ok(opened),
+        Err(err) if allow_fallback => {
+            eprintln!(
+                "warning: the saved camera {} could not be opened: {err:#}",
+                entries[*selected].name
+            );
+            for (position, entry) in entries.iter().enumerate() {
+                if position == *selected {
+                    continue;
+                }
+                let target = CameraIndex::String(entry.id.clone());
+                match open_and_spawn(&target, args) {
+                    Ok(opened) => {
+                        *selected = position;
+                        return Ok(opened);
+                    }
+                    Err(other) => {
+                        eprintln!("could not open {}: {other:#}", entry.name);
+                    }
+                }
+            }
+            Err(err)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn camera_names(entries: &[CameraEntry]) -> String {
@@ -760,7 +1053,7 @@ fn bench_gui(args: &Args) -> Result<()> {
         fill_test_pattern(&mut rgb, width, height, frames as u8);
 
         let t = Instant::now();
-        blit_rgb_to_pixels(&rgb, &mut pixels, width, args.mirror);
+        blit_rgb_to_pixels(&rgb, &mut pixels, width, args.mirror.unwrap_or(true));
         convert += t.elapsed();
 
         let t = Instant::now();
@@ -1076,19 +1369,31 @@ fn main() -> Result<()> {
     if args.bench {
         return bench_gui(&args);
     }
+    if args.forget {
+        return PrefsStore::forget();
+    }
+
+    let mut prefs = PrefsStore::load(!args.no_save);
 
     let mut entries = camera_entries();
-    let mut selected = resolve_selection(&args, &entries)?;
-    let target = CameraIndex::String(entries[selected].id.clone());
+    let mut selected = resolve_startup(&args, &prefs, &entries)?;
 
     if args.formats {
+        let target = CameraIndex::String(entries[selected].id.clone());
         return print_formats(&target, &args);
     }
     if args.probe {
+        let target = CameraIndex::String(entries[selected].id.clone());
         return probe_camera(&target, &args);
     }
 
-    let (feed, mut width, mut height) = open_and_spawn(&target, &args)?;
+    // A remembered camera that refuses to open (another program took it, the
+    // driver is still coming up) must not keep the program from starting.
+    let used_saved = !args.chose_camera()
+        && prefs
+            .saved_camera()
+            .is_some_and(|id| entries[selected].id == id);
+    let (feed, mut width, mut height) = open_selected(&args, &entries, &mut selected, used_saved)?;
 
     if width as u32 != args.width || height as u32 != args.height {
         println!(
@@ -1096,12 +1401,33 @@ fn main() -> Result<()> {
             args.width, args.height, width, height
         );
     }
+
+    // A camera is only worth remembering once it really delivers a frame: a
+    // device that opens and stays dark is not a working choice. The command
+    // line is an explicit choice too, so it starts the same way.
+    let mut save_camera_after_frame: Option<CameraEntry> = if args.chose_camera() {
+        entries.get(selected).cloned()
+    } else {
+        None
+    };
+
+    // Command line, then the saved preference, then the default.
+    let mut mirror = args.mirror.or(prefs.saved_mirror()).unwrap_or(true);
+    if let Some(wanted) = args.mirror {
+        prefs.remember_mirror(wanted);
+    }
+
+    println!("Camera: {}", entries[selected].name);
+    println!("Mirror: {}", if mirror { "on" } else { "off" });
     println!("Keys: Esc/Q quit · M mirror · S snapshot · Space freeze");
     println!("The menu bar has the same options, including a camera picker.");
+    if prefs.enabled {
+        if let Some(path) = &prefs.path {
+            println!("Preferences file: {}", path.display());
+        }
+    }
 
     let mut window = make_window(width, height)?;
-
-    let mut mirror = args.mirror;
     let mut frozen = false;
     let mut pixels: Vec<u32> = vec![0; width * height];
     // Last decoded frame, kept so a mirror toggle can repaint a frozen image.
@@ -1163,6 +1489,9 @@ fn main() -> Result<()> {
                         .iter()
                         .position(|entry| entry.id == open.target_id)
                         .unwrap_or(usize::MAX);
+                    if let Some(entry) = entries.get(selected) {
+                        save_camera_after_frame = Some(entry.clone());
+                    }
                     previous = open.previous_id;
                     last_frame_at = Instant::now();
                     frames_from_feed = 0;
@@ -1203,6 +1532,7 @@ fn main() -> Result<()> {
                     mirror_changed = true;
                     menu_changed = true;
                     redraw = true;
+                    prefs.remember_mirror(mirror);
                 }
                 MENU_FREEZE => {
                     frozen = !frozen;
@@ -1243,6 +1573,7 @@ fn main() -> Result<()> {
             mirror_changed = true;
             menu_changed = true;
             redraw = true;
+            prefs.remember_mirror(mirror);
         }
         if window.is_key_pressed(Key::Space, KeyRepeat::No) {
             frozen = !frozen;
@@ -1287,6 +1618,11 @@ fn main() -> Result<()> {
 
                                 have_frame = true;
                                 redraw = true;
+
+                                // The camera works: it is now a real preference.
+                                if let Some(entry) = save_camera_after_frame.take() {
+                                    prefs.remember_camera(&entry);
+                                }
                             }
                             Err(err) => {
                                 consecutive_errors += 1;
@@ -1377,6 +1713,8 @@ fn main() -> Result<()> {
             selected = usize::MAX;
             consecutive_errors = 0;
             frames_from_feed = 0;
+            // A camera that never showed anything must not be remembered.
+            save_camera_after_frame = None;
             first_attempt = true;
             next_attempt_at = Instant::now();
         }
@@ -1398,6 +1736,8 @@ fn main() -> Result<()> {
                     last_frame_at = Instant::now();
                     frames_from_feed = 0;
                     consecutive_errors = 0;
+                    // The fallback camera was not picked by the user.
+                    save_camera_after_frame = None;
                 }
                 None => {
                     if first_attempt {
@@ -1742,5 +2082,149 @@ mod selection_tests {
             entries(&[("FaceTime HD Camera", "a")])
         ));
         assert_eq!(selected, usize::MAX);
+    }
+}
+
+#[cfg(test)]
+mod preferences_tests {
+    use super::*;
+
+    fn entries(names: &[(&str, &str)]) -> Vec<CameraEntry> {
+        names
+            .iter()
+            .map(|(name, id)| CameraEntry {
+                name: (*name).to_string(),
+                id: (*id).to_string(),
+            })
+            .collect()
+    }
+
+    fn store(camera: Option<(&str, &str)>, mirror: Option<bool>) -> PrefsStore {
+        PrefsStore {
+            prefs: Preferences {
+                camera_id: camera.map(|(_, id)| id.to_string()),
+                camera_name: camera.map(|(name, _)| name.to_string()),
+                mirror,
+            },
+            path: None,
+            enabled: false,
+        }
+    }
+
+    fn temp_config(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("viewcam-{tag}-{}", std::process::id()));
+        let path = dir.join("config");
+        (dir, path)
+    }
+
+    #[test]
+    fn preferences_round_trip_through_text() {
+        let prefs = Preferences {
+            camera_id: Some("0x113000005e30515".to_string()),
+            camera_name: Some("USB 2.0 = Camera".to_string()),
+            mirror: Some(false),
+        };
+        assert_eq!(Preferences::parse(&prefs.render()), prefs);
+    }
+
+    #[test]
+    fn preferences_ignore_junk_and_unknown_keys() {
+        let prefs = Preferences::parse(
+            "\n# a comment\nfuture_option=1\nmirror=maybe\ncamera_id=\ncamera_name=Cam\n",
+        );
+        assert_eq!(prefs.mirror, None);
+        assert_eq!(prefs.camera_id, None);
+        assert_eq!(prefs.camera_name.as_deref(), Some("Cam"));
+    }
+
+    #[test]
+    fn preferences_accept_common_boolean_spellings() {
+        for text in ["mirror=on", "mirror=true", "mirror=1", "mirror=Yes"] {
+            assert_eq!(Preferences::parse(text).mirror, Some(true), "{text}");
+        }
+        for text in ["mirror=off", "mirror=false", "mirror=0"] {
+            assert_eq!(Preferences::parse(text).mirror, Some(false), "{text}");
+        }
+    }
+
+    #[test]
+    fn preferences_keep_names_on_one_line() {
+        let prefs = Preferences {
+            camera_name: Some("Line\nbreak".to_string()),
+            ..Preferences::default()
+        };
+        assert_eq!(
+            Preferences::parse(&prefs.render()).camera_name.as_deref(),
+            Some("Line break")
+        );
+    }
+
+    #[test]
+    fn startup_uses_the_saved_camera() {
+        let list = entries(&[("FaceTime HD Camera", "a"), ("USB Camera", "b")]);
+        let prefs = store(Some(("USB Camera", "b")), None);
+        assert_eq!(resolve_startup(&Args::default(), &prefs, &list).unwrap(), 1);
+    }
+
+    #[test]
+    fn startup_falls_back_when_the_saved_camera_is_gone() {
+        let list = entries(&[("FaceTime HD Camera", "a")]);
+        let prefs = store(Some(("USB Camera", "b")), None);
+        assert_eq!(resolve_startup(&Args::default(), &prefs, &list).unwrap(), 0);
+    }
+
+    #[test]
+    fn startup_command_line_wins_over_the_saved_camera() {
+        let list = entries(&[("FaceTime HD Camera", "a"), ("USB Camera", "b")]);
+        let prefs = store(Some(("USB Camera", "b")), None);
+        let args = Args {
+            index: Some(0),
+            ..Args::default()
+        };
+        assert_eq!(resolve_startup(&args, &prefs, &list).unwrap(), 0);
+    }
+
+    #[test]
+    fn store_writes_and_reads_the_file() {
+        let (dir, path) = temp_config("round-trip");
+        let _ = fs::remove_dir_all(&dir);
+
+        let mut prefs = PrefsStore {
+            prefs: Preferences::default(),
+            path: Some(path.clone()),
+            enabled: true,
+        };
+        prefs.remember_mirror(false);
+        prefs.remember_camera(&CameraEntry {
+            name: "USB Camera".to_string(),
+            id: "b".to_string(),
+        });
+
+        let loaded = Preferences::load(&path);
+        assert_eq!(loaded.mirror, Some(false));
+        assert_eq!(loaded.camera_id.as_deref(), Some("b"));
+        assert_eq!(loaded.camera_name.as_deref(), Some("USB Camera"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_respects_no_save() {
+        let (dir, path) = temp_config("no-save");
+        let _ = fs::remove_dir_all(&dir);
+
+        let mut prefs = PrefsStore {
+            prefs: Preferences::default(),
+            path: Some(path.clone()),
+            enabled: false,
+        };
+        prefs.remember_mirror(true);
+        prefs.remember_camera(&CameraEntry {
+            name: "USB Camera".to_string(),
+            id: "b".to_string(),
+        });
+
+        assert!(!path.exists());
+        assert!(!dir.exists());
     }
 }
