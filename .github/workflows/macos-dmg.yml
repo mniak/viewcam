@@ -1,0 +1,48 @@
+name: Build macOS DMG
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install create-dmg
+        run: brew install create-dmg
+
+      - name: Build release binary
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release
+
+      - name: Prepare DMG contents
+        run: |
+          mkdir -p dmg_contents
+          cp target/release/viewcam dmg_contents/viewcam
+          echo "Viewcam — live webcam preview" > dmg_contents/README.md
+          echo "" >> dmg_contents/README.md
+          echo "Run './viewcam --help' for usage" >> dmg_contents/README.md
+
+      - name: Create DMG
+        uses: brandond/create-dmg@v2
+        with:
+          source_dir: dmg_contents
+          dmg_name: viewcam
+          window_size: "600 400"
+          icon_size: "100"
+          app_view_applications: false
+
+      - name: Create GitHub Release and upload DMG
+        uses: softprops/action-release@v2
+        with:
+          tag_name: viewmacos
+          name: Viewmacos DMG
+          body: "macOS DMG for viewcam — native menu, hot-plug camera switching, and automatic recovery"
+          files: |
+            viewcam.dmg
+          token: ${{ secrets.GITHUB_TOKEN }}
